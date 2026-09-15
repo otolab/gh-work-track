@@ -54,7 +54,13 @@ class WorkTrackDB:
         self._tables: dict[str, Any] = {}
 
     def init_tables(self) -> None:
-        existing = set(self.db.list_tables())
+        table_list = self.db.list_tables()
+        if hasattr(table_list, "tables"):
+            existing = set(table_list.tables)
+        elif isinstance(table_list, (list, tuple)):
+            existing = {name for name in table_list if isinstance(name, str)}
+        else:
+            existing = set(table_list)
         specs = {
             EVENTS_TABLE: events_schema(),
             THREADS_TABLE: threads_schema(),
