@@ -7,6 +7,7 @@ import pytest
 
 from gh_work_track import cli, github_ops
 from gh_work_track.db import WorkTrackDB
+from gh_work_track.session import Session
 
 
 def sync_runs(db_path):
@@ -226,6 +227,125 @@ def test_event_save_failure_does_not_advance_thread_watermark(
     database = WorkTrackDB(str(db_path))
     assert database.last_successful_sync() is None
     assert database.get_thread("otolab/my-logs", 2049) is None
+
+
+def test_thread_watermark_failure_rolls_back_multiple_threads(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    refs = [
+        github_ops.ThreadRef("otolab/my-logs", 2049),
+        github_ops.ThreadRef("otolab/my-logs", 2050),
+    ]
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date: (refs, []),
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda ref, *args, **kwargs: [
+            {
+                "id": ref.number,
+                "event": "commented",
+                "created_at": timestamp,
+                "user": {"login": "alice"},
+                "body": "recent activity",
+            }
+        ],
+    )
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+
+    original_mark = Session.mark_thread_synced
+    mark_calls = 0
+
+    def fail_on_second(
+        session, repo, number, *, kind="issue", synced_at=None
+    ):
+        nonlocal mark_calls
+        mark_calls += 1
+        if mark_calls == 2:
+            raise RuntimeError("second thread watermark unavailable")
+        return original_mark(
+            session,
+            repo,
+            number,
+            kind=kind,
+            synced_at=synced_at,
+        )
+
+    monkeypatch.setattr(Session, "mark_thread_synced", fail_on_second)
+
+    assert cli.main(["--db", str(db_path), "sync"]) == 1
+    capsys.readouterr()
+
+    database = WorkTrackDB(str(db_path))
+    assert mark_calls == 2
+    assert database.last_successful_sync() is None
+    assert all(database.get_thread(ref.repo, ref.number) is None for ref in refs)
+    assert sync_runs(db_path)["status"].tolist() == ["failed"]
+
+
+def test_success_run_failure_restores_thread_watermark(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    ref = github_ops.ThreadRef("otolab/my-logs", 2049)
+    old_sync = "2026-09-16T12:00:00Z"
+    database = WorkTrackDB(str(db_path))
+    database.init_tables()
+    database.upsert_thread(
+        ref.repo,
+        ref.number,
+        title="preserve",
+        last_synced_at=old_sync,
+    )
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date: ([ref], []),
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda *args, **kwargs: [
+            {
+                "id": 1,
+                "event": "commented",
+                "created_at": timestamp,
+                "user": {"login": "alice"},
+                "body": "recent activity",
+            }
+        ],
+    )
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref_arg: [])
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+
+    original_update = WorkTrackDB.update_sync_run
+
+    def fail_success_update(self, run_id, **kwargs):
+        if kwargs.get("status") == "success":
+            raise RuntimeError("success record unavailable")
+        return original_update(self, run_id, **kwargs)
+
+    monkeypatch.setattr(WorkTrackDB, "update_sync_run", fail_success_update)
+
+    assert cli.main(["--db", str(db_path), "sync"]) == 1
+    capsys.readouterr()
+
+    restored = WorkTrackDB(str(db_path)).get_thread(ref.repo, ref.number)
+    assert restored is not None
+    assert restored["title"] == "preserve"
+    assert restored["last_synced_at"] == old_sync
+    assert WorkTrackDB(str(db_path)).last_successful_sync() is None
+    assert sync_runs(db_path)["status"].tolist() == ["failed"]
 
 
 def test_incremental_sync_same_fixture_is_idempotent(monkeypatch, tmp_path, capsys):

@@ -91,36 +91,57 @@ class Session:
             last_synced_at=candidate,
         )
 
+    def capture_thread_state(
+        self,
+        threads: list[Any],
+    ) -> dict[tuple[str, int], dict[str, Any] | None]:
+        states: dict[tuple[str, int], dict[str, Any] | None] = {}
+        for thread in threads:
+            details = _thread_details(thread)
+            if details is None:
+                continue
+            repo, number, _, _ = details
+            states[(repo, number)] = self.db.get_thread(repo, number)
+        return states
+
+    def restore_thread_state(
+        self,
+        states: dict[tuple[str, int], dict[str, Any] | None],
+    ) -> None:
+        for (repo, number), row in states.items():
+            if row is None:
+                self.db.delete_thread(repo, number)
+            else:
+                self.db.restore_thread(row)
+
     def mark_threads_synced(
         self,
         threads: list[Any],
         *,
         synced_at: datetime | None = None,
     ) -> None:
-        """Record the same successful sync boundary for every collected thread."""
+        """Record collected thread boundaries and roll back on partial failure."""
+        states = self.capture_thread_state(threads)
         seen: set[tuple[str, int]] = set()
-        for thread in threads:
-            if isinstance(thread, dict):
-                repo = str(thread.get("repo", ""))
-                raw_number = thread.get("number")
-                kind = str(thread.get("kind", "issue"))
-            else:
-                repo = str(getattr(thread, "repo", ""))
-                raw_number = getattr(thread, "number", None)
-                kind = str(getattr(thread, "kind", "issue"))
-            if not repo or raw_number is None:
-                continue
-            number = int(raw_number)
-            key = (repo, number)
-            if number <= 0 or key in seen:
-                continue
-            seen.add(key)
-            self.mark_thread_synced(
-                repo,
-                number,
-                kind=kind,
-                synced_at=synced_at,
-            )
+        try:
+            for thread in threads:
+                details = _thread_details(thread)
+                if details is None:
+                    continue
+                repo, number, kind, boundary_at = details
+                key = (repo, number)
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.mark_thread_synced(
+                    repo,
+                    number,
+                    kind=kind,
+                    synced_at=boundary_at or synced_at,
+                )
+        except Exception:
+            self.restore_thread_state(states)
+            raise
 
     def is_new_since_seen(self, repo: str, number: int, updated_at: str) -> bool:
         return self.db.is_new_since_seen(repo, number, updated_at)
@@ -136,6 +157,32 @@ class Session:
 
     def event_count(self) -> int:
         return self.db.count_events()
+
+
+def _thread_details(
+    thread: Any,
+) -> tuple[str, int, str, datetime | None] | None:
+    boundary_at = getattr(thread, "started_at", None)
+    ref = getattr(thread, "ref", thread)
+    if isinstance(thread, dict) and "ref" in thread:
+        boundary_at = thread.get("started_at")
+        ref = thread["ref"]
+    if isinstance(ref, dict):
+        repo = str(ref.get("repo", ""))
+        raw_number = ref.get("number")
+        kind = str(ref.get("kind", "issue"))
+    else:
+        repo = str(getattr(ref, "repo", ""))
+        raw_number = getattr(ref, "number", None)
+        kind = str(getattr(ref, "kind", "issue"))
+    if not repo or raw_number is None:
+        return None
+    number = int(raw_number)
+    if number <= 0:
+        return None
+    if boundary_at is not None and not isinstance(boundary_at, datetime):
+        boundary_at = None
+    return repo, number, kind, boundary_at
 
 
 _session: Session | None = None

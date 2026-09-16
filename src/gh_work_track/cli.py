@@ -143,14 +143,16 @@ def main(argv: list[str] | None = None) -> int:
                 cutoff_at=cutoff,
                 started_at=started,
             )
+            synced_threads = []
+            thread_state = {}
             try:
-                synced_threads = []
                 events, warnings, thread_count = collect_event_records(
                     cutoff=cutoff,
                     optimize_threads=mode == "incremental",
                     synced_threads=synced_threads,
                 )
                 new_count, total_count = save_events(events)
+                thread_state = session.capture_thread_state(synced_threads)
                 finished_at = datetime.now(timezone.utc)
                 session.mark_threads_synced(synced_threads, synced_at=finished_at)
                 payload = {
@@ -193,14 +195,18 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(markdown)
             except Exception as exc:
-                session.db.update_sync_run(
-                    run_id,
-                    status="failed",
-                    mode=mode,
-                    cutoff_at=cutoff,
-                    error=str(exc) or exc.__class__.__name__,
-                    finished_at=datetime.now(timezone.utc),
-                )
+                try:
+                    if thread_state:
+                        session.restore_thread_state(thread_state)
+                finally:
+                    session.db.update_sync_run(
+                        run_id,
+                        status="failed",
+                        mode=mode,
+                        cutoff_at=cutoff,
+                        error=str(exc) or exc.__class__.__name__,
+                        finished_at=datetime.now(timezone.utc),
+                    )
                 raise
             return 0
 

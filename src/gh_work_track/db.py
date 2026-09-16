@@ -281,6 +281,17 @@ class WorkTrackDB:
         )
         return rows[0] if rows else None
 
+    def delete_thread(self, repo: str, number: int) -> None:
+        self._get_table(THREADS_TABLE).delete(
+            where=f"thread_key = '{_escape_sql(thread_key(repo, number))}'"
+        )
+
+    def restore_thread(self, row: dict[str, Any]) -> None:
+        """Restore a previously captured row after a failed watermark update."""
+        self._get_table(THREADS_TABLE).merge_insert("thread_key").when_matched_update_all().when_not_matched_insert_all().execute(
+            [row]
+        )
+
     def db_max_timestamp(
         self,
         thread: Any,
