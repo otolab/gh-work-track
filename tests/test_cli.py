@@ -140,7 +140,19 @@ def test_partial_collection_failure_does_not_advance_watermark(
             raise_runtime_error("timeline unavailable"),
         )
     else:
-        monkeypatch.setattr(github_ops, "fetch_timeline", lambda *args, **kwargs: [])
+        monkeypatch.setattr(
+            github_ops,
+            "fetch_timeline",
+            lambda *args, **kwargs: [
+                {
+                    "id": 1,
+                    "event": "commented",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "user": {"login": "alice"},
+                    "body": "recent activity",
+                }
+            ],
+        )
         monkeypatch.setattr(
             github_ops,
             "fetch_all_comments",
@@ -176,7 +188,16 @@ def _mock_event_sources(monkeypatch, comments: list[dict]) -> None:
     monkeypatch.setattr(
         github_ops,
         "fetch_timeline",
-        lambda *args, **kwargs: [],
+        lambda *args, **kwargs: [
+            {
+                "id": comment["id"],
+                "event": "commented",
+                "created_at": comment["created_at"],
+                "user": comment["user"],
+                "body": comment["body"],
+            }
+            for comment in comments
+        ],
     )
     monkeypatch.setattr(
         github_ops,
@@ -191,14 +212,34 @@ def _run_json_sync(db_path, capsys) -> dict:
     return json.loads(capsys.readouterr().out)
 
 
+def test_event_save_failure_does_not_advance_thread_watermark(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    comments = [_comment(1, datetime.now(timezone.utc), "first")]
+    _mock_event_sources(monkeypatch, comments)
+    monkeypatch.setattr(cli, "save_events", raise_runtime_error("save unavailable"))
+
+    assert cli.main(["--db", str(db_path), "sync"]) == 1
+    capsys.readouterr()
+
+    database = WorkTrackDB(str(db_path))
+    assert database.last_successful_sync() is None
+    assert database.get_thread("otolab/my-logs", 2049) is None
+
+
 def test_incremental_sync_same_fixture_is_idempotent(monkeypatch, tmp_path, capsys):
     db_path = tmp_path / "lance"
     comments = [_comment(1, datetime.now(timezone.utc) - timedelta(minutes=1), "first")]
     _mock_event_sources(monkeypatch, comments)
 
     first = _run_json_sync(db_path, capsys)
-    watermark = WorkTrackDB(str(db_path)).last_successful_sync()
+    database = WorkTrackDB(str(db_path))
+    watermark = database.last_successful_sync()
+    thread = database.get_thread("otolab/my-logs", 2049)
     assert watermark is not None
+    assert thread is not None
+    assert thread["last_synced_at"]
     second = _run_json_sync(db_path, capsys)
 
     assert first["mode"] == "incremental"
@@ -259,7 +300,7 @@ def test_incremental_sync_saves_only_new_fixture_event(monkeypatch, tmp_path, ca
     comments.append(_comment(2, datetime.now(timezone.utc), "second"))
     second = _run_json_sync(db_path, capsys)
 
-    assert second["event_count"] == 2
+    assert second["event_count"] == 1
     assert second["new_count"] == 1
     assert second["total_count"] == 2
 
@@ -274,15 +315,34 @@ def test_failed_incremental_sync_keeps_watermark_for_recovery(
     _run_json_sync(db_path, capsys)
     database = WorkTrackDB(str(db_path))
     watermark_before_failure = database.last_successful_sync()
+    thread_before_failure = database.get_thread("otolab/my-logs", 2049)
     assert watermark_before_failure is not None
+    assert thread_before_failure is not None
 
     def fail_comments(ref):
         raise RuntimeError("comments unavailable")
 
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda *args, **kwargs: [
+            {
+                "id": 1,
+                "event": "commented",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "user": {"login": "alice"},
+                "body": "recent activity",
+            }
+        ],
+    )
     monkeypatch.setattr(github_ops, "fetch_all_comments", fail_comments)
     assert cli.main(["--db", str(db_path), "sync"]) == 1
     capsys.readouterr()
     assert WorkTrackDB(str(db_path)).last_successful_sync() == watermark_before_failure
+    assert (
+        WorkTrackDB(str(db_path)).get_thread("otolab/my-logs", 2049)["last_synced_at"]
+        == thread_before_failure["last_synced_at"]
+    )
 
     comments.append(_comment(2, datetime.now(timezone.utc), "recovered"))
     monkeypatch.setattr(
@@ -296,3 +356,95 @@ def test_failed_incremental_sync_keeps_watermark_for_recovery(
     assert recovered["total_count"] == 2
     rows = sync_runs(db_path)
     assert sorted(rows["status"].tolist()) == ["failed", "success", "success"]
+
+
+def test_incremental_sync_uses_thread_floor_and_skips_comments_when_timeline_is_old(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    ref = github_ops.ThreadRef("otolab/my-logs", 2049)
+    now = datetime.now(timezone.utc)
+    database = WorkTrackDB(str(db_path))
+    database.init_tables()
+    database.upsert_thread(
+        ref.repo,
+        ref.number,
+        last_synced_at=now.isoformat().replace("+00:00", "Z"),
+    )
+    calls = {"timeline": 0, "comments": 0}
+    old = _comment(1, now - timedelta(hours=1), "old")
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date: ([ref], []),
+    )
+
+    def fetch_old_timeline(*args, **kwargs):
+        calls["timeline"] += 1
+        return [
+            {
+                "id": old["id"],
+                "event": "commented",
+                "created_at": old["created_at"],
+                "user": old["user"],
+                "body": old["body"],
+            }
+        ]
+
+    def fetch_comments(ref_arg):
+        calls["comments"] += 1
+        return [old]
+
+    monkeypatch.setattr(github_ops, "fetch_timeline", fetch_old_timeline)
+    monkeypatch.setattr(github_ops, "fetch_all_comments", fetch_comments)
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+
+    result = _run_json_sync(db_path, capsys)
+
+    assert result["event_count"] == 0
+    assert result["new_count"] == 0
+    assert calls == {"timeline": 1, "comments": 0}
+    assert sum(calls.values()) < 2
+
+
+def test_comments_are_fetched_when_timeline_has_recent_activity(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    ref = github_ops.ThreadRef("otolab/my-logs", 2049)
+    recent = _comment(1, datetime.now(timezone.utc), "recent")
+    calls = {"comments": 0}
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date: ([ref], []),
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda *args, **kwargs: [
+            {
+                "id": recent["id"],
+                "event": "commented",
+                "created_at": recent["created_at"],
+                "user": recent["user"],
+                "body": recent["body"],
+            }
+        ],
+    )
+
+    def fetch_comments(ref_arg):
+        calls["comments"] += 1
+        return [recent]
+
+    monkeypatch.setattr(github_ops, "fetch_all_comments", fetch_comments)
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+
+    result = _run_json_sync(db_path, capsys)
+
+    assert result["event_count"] == 1
+    assert calls["comments"] == 1

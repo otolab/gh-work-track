@@ -52,6 +52,8 @@ uv run gh-work-track daily --date 2026-09-15
 
 GitHub 側の discovery や通知が遅れてスレッドに載る場合は、次回の `sync` で拾います。
 
+incremental sync では、スレッドごとに記録した `last_synced_at` と DB 内の最新イベント時刻も cutoff の下限として使います。timeline に cutoff 以降の activity がないスレッドでは comments の取得を省略します。GitHub の timeline API は返却順を保証していないため、新→古と確認できたページだけ early stop を行い、古→新または順序不明の場合は取りこぼし防止のため全ページを取得します。
+
 ### 修復・初回: `sync --since N`
 
 任意期間を取り直すときや初回のバックフィルには `sync --since N` を使います。これは backfill 専用で、watermark を使わず直近 `N` 日（`N >= 1`）を取得します。完了後の日常運用は、引数なしの `sync` に戻してください。

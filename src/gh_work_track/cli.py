@@ -144,8 +144,15 @@ def main(argv: list[str] | None = None) -> int:
                 started_at=started,
             )
             try:
-                events, warnings, thread_count = collect_event_records(cutoff=cutoff)
+                synced_threads = []
+                events, warnings, thread_count = collect_event_records(
+                    cutoff=cutoff,
+                    optimize_threads=mode == "incremental",
+                    synced_threads=synced_threads,
+                )
                 new_count, total_count = save_events(events)
+                finished_at = datetime.now(timezone.utc)
+                session.mark_threads_synced(synced_threads, synced_at=finished_at)
                 payload = {
                     **metadata,
                     "cutoff_at": metadata["cutoff"],
@@ -179,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                     new_count=new_count,
                     warnings=warnings,
                     error="",
-                    finished_at=datetime.now(timezone.utc),
+                    finished_at=finished_at,
                 )
                 if args.json:
                     print(json.dumps(payload, ensure_ascii=False, indent=2))

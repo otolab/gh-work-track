@@ -229,23 +229,40 @@ class WorkTrackDB:
         repo: str,
         number: int,
         *,
-        kind: str = "issue",
-        title: str = "",
-        watch_note: str = "",
-        is_watched: bool = False,
-        last_seen_at: str = "",
-        last_synced_at: str = "",
+        kind: str | None = None,
+        title: str | None = None,
+        watch_note: str | None = None,
+        is_watched: bool | None = None,
+        last_seen_at: str | None = None,
+        last_synced_at: str | None = None,
     ) -> None:
+        existing = self.get_thread(repo, number)
         row = {
             "thread_key": thread_key(repo, number),
             "repo": repo,
             "number": int(number),
-            "kind": kind,
-            "title": title,
-            "is_watched": bool(is_watched),
-            "watch_note": watch_note,
-            "last_seen_at": last_seen_at,
-            "last_synced_at": last_synced_at,
+            "kind": str(kind if kind is not None else (existing or {}).get("kind", "issue")),
+            "title": str(title if title is not None else (existing or {}).get("title", "")),
+            "is_watched": bool(
+                is_watched
+                if is_watched is not None
+                else (existing or {}).get("is_watched", False)
+            ),
+            "watch_note": str(
+                watch_note
+                if watch_note is not None
+                else (existing or {}).get("watch_note", "")
+            ),
+            "last_seen_at": str(
+                last_seen_at
+                if last_seen_at is not None
+                else (existing or {}).get("last_seen_at", "")
+            ),
+            "last_synced_at": str(
+                last_synced_at
+                if last_synced_at is not None
+                else (existing or {}).get("last_synced_at", "")
+            ),
             "updated_at": _now_ms(),
         }
         table = self._get_table(THREADS_TABLE)
@@ -263,6 +280,55 @@ class WorkTrackDB:
             .to_list()
         )
         return rows[0] if rows else None
+
+    def db_max_timestamp(
+        self,
+        thread: Any,
+        number: int | None = None,
+    ) -> datetime | None:
+        """Return the newest stored event timestamp for a thread.
+
+        ``thread`` may be a ``ThreadRef``-like object or mapping.  Passing a
+        repository string together with ``number`` is also supported so this
+        DB layer does not need to import the GitHub API types.
+        """
+        if number is None:
+            if isinstance(thread, dict):
+                repo = str(thread.get("repo", ""))
+                raw_number = thread.get("number")
+            else:
+                repo = str(getattr(thread, "repo", ""))
+                raw_number = getattr(thread, "number", None)
+            if raw_number is None:
+                return None
+            number = int(raw_number)
+        else:
+            repo = str(thread)
+
+        if not repo or number <= 0:
+            return None
+        rows = (
+            self._get_table(EVENTS_TABLE)
+            .search()
+            .where(
+                f"thread_key = '{_escape_sql(thread_key(repo, number))}'"
+            )
+            .to_pandas()
+        )
+        if rows.empty or "timestamp" not in rows:
+            return None
+        timestamps = pd.to_datetime(rows["timestamp"], utc=True, errors="coerce").dropna()
+        if timestamps.empty:
+            return None
+        timestamp = pd.Timestamp(timestamps.max())
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return timestamp.to_pydatetime()
+
+    # Descriptive alias for callers that do not use the Issue terminology.
+    max_event_timestamp = db_max_timestamp
 
     def is_new_since_seen(self, repo: str, number: int, updated_at: str) -> bool:
         existing = self.get_thread(repo, number)
