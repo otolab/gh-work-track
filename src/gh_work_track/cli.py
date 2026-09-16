@@ -127,9 +127,14 @@ def main(argv: list[str] | None = None) -> int:
                 if args.since is not None
                 else session.db.last_successful_sync()
             )
+            last_successful_started_at = (
+                None
+                if args.since is not None
+                else session.db.last_successful_sync_started_at()
+            )
             cutoff, mode = resolve_sync_cutoff(
                 since_days=args.since,
-                last_successful_sync=last_successful,
+                last_successful_sync=last_successful_started_at,
                 now=started,
             )
             metadata = sync_output_metadata(

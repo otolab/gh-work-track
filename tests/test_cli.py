@@ -478,6 +478,115 @@ def test_failed_incremental_sync_keeps_watermark_for_recovery(
     assert sorted(rows["status"].tolist()) == ["failed", "success", "success"]
 
 
+def test_incremental_sync_uses_previous_run_start_for_long_run_overlap(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    ref = github_ops.ThreadRef("otolab/my-logs", 2049)
+    previous_started = datetime(2026, 9, 17, 11, 50, tzinfo=timezone.utc)
+    previous_finished = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+    current_started = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+    current_finished = datetime(2026, 9, 17, 12, 10, tzinfo=timezone.utc)
+    next_started = datetime(2026, 9, 17, 12, 20, tzinfo=timezone.utc)
+    next_finished = datetime(2026, 9, 17, 12, 21, tzinfo=timezone.utc)
+    late_at = datetime(2026, 9, 17, 12, 1, tzinfo=timezone.utc)
+    old = _comment(
+        1,
+        datetime(2026, 9, 17, 11, 59, tzinfo=timezone.utc),
+        "old event",
+    )
+    late = _comment(2, late_at, "created during collection")
+
+    database = WorkTrackDB(str(db_path))
+    database.init_tables()
+    database.upsert_thread(
+        ref.repo,
+        ref.number,
+        last_synced_at=previous_started.isoformat().replace("+00:00", "Z"),
+    )
+    database.record_sync_run(
+        since_days=None,
+        thread_count=1,
+        event_count=0,
+        new_count=0,
+        warnings=[],
+        status="success",
+        mode="incremental",
+        started_at=previous_started,
+        finished_at=previous_finished,
+    )
+
+    class CliClock(datetime):
+        values = [current_started, current_finished, next_started, next_finished]
+        calls = []
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls.append(len(cls.calls))
+            value = cls.values.pop(0)
+            return value.astimezone(tz) if tz is not None else value
+
+    class CollectorClock(datetime):
+        values = [current_started, current_started, next_started, next_started]
+        calls = []
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls.append(len(cls.calls))
+            value = cls.values.pop(0)
+            return value.astimezone(tz) if tz is not None else value
+
+    monkeypatch.setattr(cli, "datetime", CliClock)
+    monkeypatch.setattr(github_ops, "datetime", CollectorClock)
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date: ([ref], []),
+    )
+    timeline_calls = 0
+    effective_cutoffs = []
+
+    def fetch_timeline(ref_arg, *args, **kwargs):
+        nonlocal timeline_calls
+        timeline_calls += 1
+        effective_cutoffs.append(kwargs["cutoff"])
+        return [
+            {
+                "id": event["id"],
+                "event": "commented",
+                "created_at": event["created_at"],
+                "user": event["user"],
+                "body": event["body"],
+            }
+            for event in ([old] if timeline_calls == 1 else [old, late])
+        ]
+
+    monkeypatch.setattr(github_ops, "fetch_timeline", fetch_timeline)
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref_arg: [])
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+
+    first = _run_json_sync(db_path, capsys)
+    second = _run_json_sync(db_path, capsys)
+
+    assert first["cutoff"] == "2026-09-17T11:45:00Z"
+    assert first["watermark"] == "2026-09-17T12:00:00Z"
+    assert second["cutoff"] == "2026-09-17T11:55:00Z"
+    assert second["watermark"] == "2026-09-17T12:10:00Z"
+    assert second["event_count"] == 1
+    assert second["new_count"] == 1
+    assert effective_cutoffs == [previous_started, current_started]
+    assert len(CliClock.calls) == 4
+    assert len(CollectorClock.calls) == 4
+    final_database = WorkTrackDB(str(db_path))
+    assert final_database.count_events() == 2
+    stored = final_database.events_for_date("2026-09-17")
+    assert [event["timestamp"] for event in stored] == [
+        old["created_at"],
+        late["created_at"],
+    ]
+
+
 def test_incremental_sync_uses_thread_floor_and_skips_comments_when_timeline_is_old(
     monkeypatch, tmp_path, capsys
 ):

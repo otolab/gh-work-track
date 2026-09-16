@@ -122,3 +122,48 @@ def test_last_successful_sync_ignores_failed_runs(db: WorkTrackDB):
     )
 
     assert db.last_successful_sync() == earlier
+
+
+def test_last_successful_sync_started_at_uses_latest_successful_run(
+    db: WorkTrackDB,
+):
+    first_started = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
+    first_finished = datetime(2026, 9, 17, 10, 10, tzinfo=timezone.utc)
+    latest_started = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+    latest_finished = datetime(2026, 9, 17, 12, 10, tzinfo=timezone.utc)
+    db.record_sync_run(
+        since_days=None,
+        thread_count=1,
+        event_count=1,
+        new_count=1,
+        warnings=[],
+        status="success",
+        mode="incremental",
+        started_at=first_started,
+        finished_at=first_finished,
+    )
+    db.record_sync_run(
+        since_days=None,
+        thread_count=1,
+        event_count=1,
+        new_count=0,
+        warnings=[],
+        status="failed",
+        mode="incremental",
+        started_at=datetime(2026, 9, 17, 11, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 17, 11, 10, tzinfo=timezone.utc),
+    )
+    db.record_sync_run(
+        since_days=None,
+        thread_count=1,
+        event_count=2,
+        new_count=1,
+        warnings=[],
+        status="success",
+        mode="incremental",
+        started_at=latest_started,
+        finished_at=latest_finished,
+    )
+
+    assert db.last_successful_sync() == latest_finished
+    assert db.last_successful_sync_started_at() == latest_started

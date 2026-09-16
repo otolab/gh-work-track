@@ -656,9 +656,9 @@ def resolve_sync_cutoff(
     """Resolve the effective cutoff and mode for a sync run.
 
     An explicit ``since_days`` is a backfill and deliberately does not inspect
-    the watermark.  Incremental runs use the previous successful completion
-    with a small overlap so events near the boundary can be re-read safely;
-    the first run uses the bootstrap period instead.
+    the watermark.  Incremental runs use the previous successful collection
+    start boundary with a small overlap so events collected during that run
+    can be re-read safely; the first run uses the bootstrap period instead.
     """
     if overlap_minutes < 0:
         raise ValueError("overlap_minutes は 0 以上で指定してください")
@@ -804,7 +804,8 @@ def collect_event_records(
     overlap is applied.  When supplied, ``since_days`` selects backfill mode
     and its computed cutoff takes precedence over ``cutoff``.
 
-    Per-thread floors are used for incremental collection.  Explicit
+    Per-thread floors are used for incremental collection.  The global cutoff
+    is based on the previous successful run's start boundary.  Explicit
     ``since_days`` backfills keep their global cutoff so they can repair older
     data.
     """
@@ -818,7 +819,7 @@ def collect_event_records(
         )
     elif cutoff is None:
         cutoff, _ = resolve_sync_cutoff(
-            last_successful_sync=get_session().db.last_successful_sync(),
+            last_successful_sync=get_session().db.last_successful_sync_started_at(),
             now=datetime.now(timezone.utc),
             overlap_minutes=overlap_minutes,
         )
@@ -1155,9 +1156,14 @@ def cmd_collect(args: argparse.Namespace) -> int:
     last_successful = (
         None if args.since is not None else get_session().db.last_successful_sync()
     )
+    last_successful_started_at = (
+        None
+        if args.since is not None
+        else get_session().db.last_successful_sync_started_at()
+    )
     cutoff, mode = resolve_sync_cutoff(
         since_days=args.since,
-        last_successful_sync=last_successful,
+        last_successful_sync=last_successful_started_at,
         now=now,
     )
     metadata = sync_output_metadata(

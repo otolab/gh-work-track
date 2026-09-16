@@ -457,19 +457,45 @@ class WorkTrackDB:
             raise ValueError(f"sync run not found: {run_id}")
 
     def last_successful_sync(self) -> datetime | None:
-        table = self._get_table(SYNC_RUNS_TABLE)
-        columns = set(table.schema.names)
-        rows = table.search().to_pandas()
-        if rows.empty:
-            return None
-        if "status" in columns:
-            rows = rows[rows["status"] == "success"]
+        rows = self._successful_sync_rows()
         if rows.empty:
             return None
         finished = rows["finished_at"].dropna()
         if finished.empty:
             return None
         timestamp = pd.Timestamp(finished.max())
+        return self._to_utc_datetime(timestamp)
+
+    def last_successful_sync_started_at(self) -> datetime | None:
+        """Return the start of the latest successful sync run.
+
+        Incremental collection uses this as its global discovery boundary.
+        A run may last longer than the overlap window, so using its completion
+        time could move the next cutoff past per-thread acquisition starts.
+        """
+        rows = self._successful_sync_rows()
+        if rows.empty or "started_at" not in rows or "finished_at" not in rows:
+            return None
+        rows = rows.dropna(subset=["finished_at"]).sort_values("finished_at")
+        if rows.empty:
+            return None
+        started = rows.iloc[-1]["started_at"]
+        if pd.isna(started):
+            return None
+        return self._to_utc_datetime(pd.Timestamp(started))
+
+    def _successful_sync_rows(self):
+        table = self._get_table(SYNC_RUNS_TABLE)
+        columns = set(table.schema.names)
+        rows = table.search().to_pandas()
+        if rows.empty:
+            return rows
+        if "status" in columns:
+            rows = rows[rows["status"] == "success"]
+        return rows
+
+    @staticmethod
+    def _to_utc_datetime(timestamp: pd.Timestamp) -> datetime:
         if timestamp.tzinfo is None:
             timestamp = timestamp.tz_localize("UTC")
         else:

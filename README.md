@@ -44,15 +44,15 @@ uv run gh-work-track sync
 uv run gh-work-track daily --date 2026-09-15
 ```
 
-通常の `sync` は incremental モードで動作し、前回成功した sync の `finished_at` を watermark として、その時刻の少し前から取得します。初回は bootstrap として直近 7 日を対象にします。
+通常の `sync` は incremental モードで動作し、前回成功した sync の取得開始時刻を global cutoff の基準として、その時刻の 5 分前から取得します。前回成功 run の完了時刻は出力 metadata の `watermark` に保持します。初回は bootstrap として直近 7 日を対象にします。
 
 ### 日常運用: `sync`
 
-引数なしの `sync` を定期的に実行してください。境界付近の取りこぼしを防ぐため、前回成功 sync の時刻より 5 分前から取得する overlap buffer（`SYNC_OVERLAP_MINUTES=5`）を使います。重複したイベントは `dedup_key` で統合されます。
+引数なしの `sync` を定期的に実行してください。境界付近の取りこぼしを防ぐため、前回成功 sync の取得開始時刻より 5 分前から取得する overlap buffer（`SYNC_OVERLAP_MINUTES=5`）を使います。重複したイベントは `dedup_key` で統合されます。
 
 GitHub 側の discovery や通知が遅れてスレッドに載る場合は、次回の `sync` で拾います。
 
-incremental sync では、スレッドごとの取得開始境界として記録した `last_synced_at` と DB 内の最新イベント時刻も cutoff の下限として使います。取得開始後に発生したイベントは次回の対象に残ります。timeline に cutoff 以降の activity がないスレッドでは comments の取得を省略します。GitHub の timeline API は返却順を保証していないため、新→古と確認できたページだけ early stop を行い、古→新または順序不明の場合は取りこぼし防止のため全ページを取得します。
+incremental sync では、前回成功 run の取得開始時刻を global cutoff の基準にし、スレッドごとの取得開始境界として記録した `last_synced_at` と DB 内の最新イベント時刻も cutoff の下限として使います。run が overlap を超えて長時間かかっても、スレッド取得開始後から run 完了までに発生したイベントは次回の対象に残ります。timeline に cutoff 以降の activity がないスレッドでは comments の取得を省略します。GitHub の timeline API は返却順を保証していないため、新→古と確認できたページだけ early stop を行い、古→新または順序不明の場合は取りこぼし防止のため全ページを取得します。
 
 ### 修復・初回: `sync --since N`
 
