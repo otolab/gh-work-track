@@ -18,6 +18,7 @@ from gh_work_track.github_ops import (
     cmd_watch,
     collect_event_records,
     format_collect_markdown,
+    resolve_sync_cutoff,
     save_events,
 )
 from gh_work_track.migrate import migrate_legacy
@@ -120,15 +121,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"collect", "sync"}:
             session = open_session(args.db, read_only=False)
             started = datetime.now(timezone.utc)
+            last_successful = (
+                None
+                if args.since is not None
+                else session.db.last_successful_sync()
+            )
+            cutoff, mode = resolve_sync_cutoff(
+                since_days=args.since,
+                last_successful_sync=last_successful,
+                now=started,
+            )
             run_id = session.db.start_sync_run(
                 since_days=args.since,
-                mode="backfill",
+                mode=mode,
+                cutoff_at=cutoff,
                 started_at=started,
             )
             try:
-                events, warnings, thread_count = collect_event_records(args.since)
+                events, warnings, thread_count = collect_event_records(cutoff=cutoff)
                 new_count, total_count = save_events(events)
                 payload = {
+                    "mode": mode,
+                    "cutoff_at": cutoff.isoformat(),
                     "since_days": args.since,
                     "thread_count": thread_count,
                     "event_count": len(events),
@@ -144,10 +158,14 @@ def main(argv: list[str] | None = None) -> int:
                     total_count,
                     thread_count,
                     warnings,
+                    mode=mode,
+                    cutoff=cutoff,
                 )
                 session.db.update_sync_run(
                     run_id,
                     status="success",
+                    mode=mode,
+                    cutoff_at=cutoff,
                     thread_count=thread_count,
                     event_count=len(events),
                     new_count=new_count,
@@ -163,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
                 session.db.update_sync_run(
                     run_id,
                     status="failed",
+                    mode=mode,
+                    cutoff_at=cutoff,
                     error=str(exc) or exc.__class__.__name__,
                     finished_at=datetime.now(timezone.utc),
                 )

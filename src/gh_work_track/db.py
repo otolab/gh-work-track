@@ -346,10 +346,12 @@ class WorkTrackDB:
         event_count: int | None = None,
         new_count: int | None = None,
         warnings: list[str] | None = None,
+        mode: str | None = None,
+        cutoff_at: datetime | None = None,
         error: str | None = None,
         finished_at: datetime | None = None,
     ) -> None:
-        self._validate_sync_run_values(status=status, mode=None)
+        self._validate_sync_run_values(status=status, mode=mode)
         values: dict[str, Any] = {"status": status}
         if thread_count is not None:
             values["thread_count"] = int(thread_count)
@@ -359,6 +361,10 @@ class WorkTrackDB:
             values["new_count"] = int(new_count)
         if warnings is not None:
             values["warnings"] = json.dumps(warnings, ensure_ascii=False)
+        if mode is not None:
+            values["mode"] = mode
+        if cutoff_at is not None:
+            values["cutoff_at"] = self._timestamp(cutoff_at)
         if error is not None:
             values["error"] = str(error)
         if finished_at is not None or status != "running":

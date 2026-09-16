@@ -4,7 +4,7 @@
 Usage:
   gh-work-track.py list [--since DAYS] [--all] [--watch] [--json]
   gh-work-track.py drill <ref> [--comments N] [--json]
-  gh-work-track.py collect --since DAYS [--json]
+  gh-work-track.py collect [--since DAYS] [--json]
   gh-work-track.py daily (--date YYYY-MM-DD | --since DAYS) [--json]
   gh-work-track.py watch {list|add|remove} [ref ...]
   gh-work-track.py mark-seen <ref>   # update last-seen after drill
@@ -34,6 +34,8 @@ from gh_work_track.config import db_path as default_db_path
 from gh_work_track.session import get_session
 
 DEFAULT_REPO = "plaidev/karte-io-systems"
+SYNC_BOOTSTRAP_DAYS = 7
+SYNC_OVERLAP_MINUTES = 5
 MINE_REPOS = [
     "plaidev/karte-io-systems",
     "plaidev/karte-io-systems-ops",
@@ -534,9 +536,48 @@ def group_notifications(notifs: list[dict[str, Any]]) -> dict[str, tuple[ThreadR
     return grouped
 
 
-def since_iso(since_days: int) -> str:
-    since = datetime.now(timezone.utc) - timedelta(days=since_days)
-    return since.isoformat().replace("+00:00", "Z")
+def normalize_datetime(value: datetime) -> datetime:
+    """Return a timezone-aware UTC datetime for sync cutoff comparisons."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def since_iso(cutoff: datetime) -> str:
+    """Format a cutoff for GitHub's notifications ``since`` parameter."""
+    return normalize_datetime(cutoff).isoformat().replace("+00:00", "Z")
+
+
+def since_days_iso(since_days: int) -> str:
+    """Format the legacy day-based period used by the list command."""
+    return since_iso(datetime.now(timezone.utc) - timedelta(days=since_days))
+
+
+def resolve_sync_cutoff(
+    *,
+    since_days: int | None = None,
+    last_successful_sync: datetime | None = None,
+    now: datetime | None = None,
+    overlap_minutes: int = SYNC_OVERLAP_MINUTES,
+) -> tuple[datetime, str]:
+    """Resolve the effective cutoff and mode for a sync run.
+
+    An explicit ``since_days`` is a backfill and deliberately does not inspect
+    the watermark.  Incremental runs use the previous successful completion
+    with a small overlap so events near the boundary can be re-read safely;
+    the first run uses the bootstrap period instead.
+    """
+    if overlap_minutes < 0:
+        raise ValueError("overlap_minutes は 0 以上で指定してください")
+    current = normalize_datetime(now or datetime.now(timezone.utc))
+    if since_days is not None:
+        if since_days < 1:
+            raise ValueError("--since は 1 以上の日数を指定してください")
+        return current - timedelta(days=since_days), "backfill"
+    if last_successful_sync is not None:
+        watermark = normalize_datetime(last_successful_sync)
+        return watermark - timedelta(minutes=overlap_minutes), "incremental"
+    return current - timedelta(days=SYNC_BOOTSTRAP_DAYS), "incremental"
 
 
 def search_thread_ref(item: dict[str, Any], kind_hint: str) -> ThreadRef | None:
@@ -625,13 +666,37 @@ def event_is_since(record: dict[str, Any], cutoff: datetime) -> bool:
     return bool(timestamp and timestamp >= cutoff)
 
 
-def collect_event_records(since_days: int) -> tuple[list[dict[str, Any]], list[str], int]:
-    if since_days < 1:
-        raise ValueError("--since は 1 以上の日数を指定してください")
-    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+def collect_event_records(
+    *,
+    cutoff: datetime | None = None,
+    since_days: int | None = None,
+    overlap_minutes: int = SYNC_OVERLAP_MINUTES,
+) -> tuple[list[dict[str, Any]], list[str], int]:
+    """Collect events at or after the effective sync cutoff.
+
+    ``cutoff`` is an already-resolved incremental cutoff.  When omitted, the
+    previous successful sync is looked up from the active session and the
+    overlap is applied.  When supplied, ``since_days`` selects backfill mode
+    and its computed cutoff takes precedence over ``cutoff``.
+    """
+    if since_days is not None:
+        cutoff, _ = resolve_sync_cutoff(
+            since_days=since_days,
+            now=datetime.now(timezone.utc),
+            overlap_minutes=overlap_minutes,
+        )
+    elif cutoff is None:
+        cutoff, _ = resolve_sync_cutoff(
+            last_successful_sync=get_session().db.last_successful_sync(),
+            now=datetime.now(timezone.utc),
+            overlap_minutes=overlap_minutes,
+        )
+    else:
+        cutoff = normalize_datetime(cutoff)
+
     warnings: list[str] = []
     try:
-        notifications = fetch_notifications(since=since_iso(since_days))
+        notifications = fetch_notifications(since=since_iso(cutoff))
     except RuntimeError as exc:
         raise SyncCollectionError(f"notifications: {exc}") from exc
     refs: dict[str, ThreadRef] = {}
@@ -713,15 +778,24 @@ def collect_event_records(since_days: int) -> tuple[list[dict[str, Any]], list[s
 
 
 def format_collect_markdown(
-    since_days: int,
+    since_days: int | None,
     event_count: int,
     new_count: int,
     total_count: int,
     thread_count: int,
     warnings: list[str],
+    *,
+    mode: str = "backfill",
+    cutoff: datetime | None = None,
 ) -> str:
     lines = [f"## gh-work-track collect ({datetime.now().strftime('%Y-%m-%d %H:%M')})", ""]
-    lines.append(f"期間: 直近 {since_days} 日 / 対象スレッド: {thread_count} 件")
+    if mode == "incremental" and cutoff is not None:
+        period = f"{since_iso(cutoff)} 以降"
+    elif since_days is not None:
+        period = f"直近 {since_days} 日"
+    else:
+        period = "指定された cutoff 以降"
+    lines.append(f"モード: {mode} / 期間: {period} / 対象スレッド: {thread_count} 件")
     lines.append(f"取得イベント: {event_count} 件 / 新規保存: {new_count} 件 / 累積: {total_count} 件")
     lines.append(f"保存先: `{default_db_path()}`")
     if warnings:
@@ -760,7 +834,7 @@ def collect_threads(
     include_watch: bool = True,
     include_mine: bool = True,
 ) -> list[ThreadSummary]:
-    since = since_iso(since_days)
+    since = since_days_iso(since_days)
     watch_map = {f"{t['repo']}#{t['number']}": t.get("note", "") for t in load_watch()}
     summaries: dict[str, ThreadSummary] = {}
 
@@ -918,10 +992,21 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
-    events, warnings, thread_count = collect_event_records(args.since)
+    now = datetime.now(timezone.utc)
+    last_successful = (
+        None if args.since is not None else get_session().db.last_successful_sync()
+    )
+    cutoff, mode = resolve_sync_cutoff(
+        since_days=args.since,
+        last_successful_sync=last_successful,
+        now=now,
+    )
+    events, warnings, thread_count = collect_event_records(cutoff=cutoff)
     new_count, total_count = save_events(events)
     if args.json:
         print(json.dumps({
+            "mode": mode,
+            "cutoff_at": cutoff.isoformat(),
             "since_days": args.since,
             "thread_count": thread_count,
             "event_count": len(events),
@@ -938,6 +1023,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
             total_count,
             thread_count,
             warnings,
+            mode=mode,
+            cutoff=cutoff,
         ))
     return 0
 
@@ -1128,12 +1215,12 @@ def build_parser() -> argparse.ArgumentParser:
     lp.set_defaults(func=cmd_list)
 
     cp = sub.add_parser("collect", help="自分に関するイベントを取得して保存（sync の別名）")
-    cp.add_argument("--since", type=int, required=True, help="イベントを遡る日数")
+    cp.add_argument("--since", type=int, help="イベントを遡る日数（指定時は backfill。未指定は incremental）")
     cp.add_argument("--json", action="store_true")
     cp.set_defaults(func=cmd_collect)
 
     sp = sub.add_parser("sync", help="GitHub からイベントを同期")
-    sp.add_argument("--since", type=int, required=True, help="イベントを遡る日数")
+    sp.add_argument("--since", type=int, help="イベントを遡る日数（指定時は backfill。未指定は incremental）")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_collect)
 
