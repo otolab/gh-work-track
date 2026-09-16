@@ -37,7 +37,9 @@ LanceDB 本体: `$GH_WORK_TRACK_HOME/lance/`
 uv run gh-work-track init
 uv run gh-work-track migrate
 
-# 同期・日次
+# 同期（通常は前回成功時刻からの incremental）
+uv run gh-work-track sync
+# 任意期間を取り直す backfill（watermark は無視）
 uv run gh-work-track sync --since 1
 uv run gh-work-track daily --date 2026-09-15
 
