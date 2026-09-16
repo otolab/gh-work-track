@@ -57,6 +57,10 @@ REASON_JA = {
 SKIP_REASONS = {"ci_activity"}
 
 
+class SyncCollectionError(RuntimeError):
+    """A source failure that makes a sync unsuitable as a watermark."""
+
+
 @dataclass
 class ThreadRef:
     repo: str
@@ -588,8 +592,9 @@ def fetch_search_threads(since_date: str) -> tuple[list[ThreadRef], list[str]]:
                 fields,
             ]) or []
         except RuntimeError as exc:
-            warnings.append(f"gh search {search_kind} --{qualifier}: {exc}")
-            continue
+            raise SyncCollectionError(
+                f"gh search {search_kind} --{qualifier}: {exc}"
+            ) from exc
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -628,8 +633,7 @@ def collect_event_records(since_days: int) -> tuple[list[dict[str, Any]], list[s
     try:
         notifications = fetch_notifications(since=since_iso(since_days))
     except RuntimeError as exc:
-        notifications = []
-        warnings.append(f"notifications: {exc}")
+        raise SyncCollectionError(f"notifications: {exc}") from exc
     refs: dict[str, ThreadRef] = {}
     notifications_by_ref: dict[str, list[dict[str, Any]]] = {}
     fallback_notifications: list[dict[str, Any]] = []
@@ -679,11 +683,11 @@ def collect_event_records(since_days: int) -> tuple[list[dict[str, Any]], list[s
         try:
             timeline = fetch_timeline(ref, per_page=100, paginate=True)
         except RuntimeError as exc:
-            warnings.append(f"{ref_key} timeline: {exc}")
+            raise SyncCollectionError(f"{ref_key} timeline: {exc}") from exc
         try:
             comments = fetch_all_comments(ref)
         except RuntimeError as exc:
-            warnings.append(f"{ref_key} comments: {exc}")
+            raise SyncCollectionError(f"{ref_key} comments: {exc}") from exc
 
         thread_events = [
             event
