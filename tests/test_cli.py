@@ -41,6 +41,17 @@ def test_sync_records_success(monkeypatch, tmp_path):
     assert rows.iloc[0]["event_count"] == 1
 
 
+def test_sync_help_explains_incremental_and_backfill_modes(capsys):
+    for command in ("sync", "collect"):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main([command, "--help"])
+
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "バックフィル専用" in output
+        assert "前回成功 sync 以降の incremental" in output
+
+
 def test_sync_since_uses_backfill_without_reading_watermark(monkeypatch, tmp_path):
     db_path = tmp_path / "lance"
     collected = {}
@@ -186,13 +197,57 @@ def test_incremental_sync_same_fixture_is_idempotent(monkeypatch, tmp_path, caps
     _mock_event_sources(monkeypatch, comments)
 
     first = _run_json_sync(db_path, capsys)
+    watermark = WorkTrackDB(str(db_path)).last_successful_sync()
+    assert watermark is not None
     second = _run_json_sync(db_path, capsys)
 
     assert first["mode"] == "incremental"
+    assert first["cutoff"] == first["cutoff_at"]
+    assert first["watermark"] is None
+    assert first["bootstrap"] is True
     assert first["new_count"] == 1
     assert second["mode"] == "incremental"
+    assert second["cutoff"] == second["cutoff_at"]
+    assert second["watermark"] == github_ops.since_iso(watermark)
+    assert second["bootstrap"] is False
     assert second["new_count"] == 0
     assert second["total_count"] == 1
+
+
+def test_incremental_sync_text_includes_sync_metadata(monkeypatch, tmp_path, capsys):
+    db_path = tmp_path / "lance"
+    monkeypatch.setattr(
+        cli,
+        "collect_event_records",
+        lambda **kwargs: ([], [], 0),
+    )
+    monkeypatch.setattr(cli, "save_events", lambda events: (0, 0))
+
+    assert cli.main(["--db", str(db_path), "sync"]) == 0
+
+    output = capsys.readouterr().out
+    assert "mode: incremental" in output
+    assert "cutoff: " in output
+    assert "watermark: null" in output
+    assert "bootstrap: true" in output
+
+
+def test_backfill_output_has_null_watermark_and_no_bootstrap(monkeypatch, tmp_path, capsys):
+    db_path = tmp_path / "lance"
+    monkeypatch.setattr(
+        cli,
+        "collect_event_records",
+        lambda **kwargs: ([], [], 0),
+    )
+    monkeypatch.setattr(cli, "save_events", lambda events: (0, 0))
+
+    assert cli.main(["--db", str(db_path), "sync", "--since", "2", "--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["mode"] == "backfill"
+    assert output["cutoff"] == output["cutoff_at"]
+    assert output["watermark"] is None
+    assert output["bootstrap"] is False
 
 
 def test_incremental_sync_saves_only_new_fixture_event(monkeypatch, tmp_path, capsys):
