@@ -20,6 +20,9 @@ from gh_work_track.schemas import (
     threads_schema,
 )
 
+SYNC_STATUSES = {"running", "success", "failed"}
+SYNC_MODES = {"incremental", "backfill"}
+
 
 def _escape_sql(value: str) -> str:
     return value.replace("'", "''")
@@ -74,7 +77,35 @@ class WorkTrackDB:
             except ValueError as exc:
                 if "already exists" not in str(exc):
                     raise
+        self._ensure_sync_runs_schema()
         self._ensure_indexes()
+
+    def _ensure_sync_runs_schema(self) -> None:
+        """Add status fields to databases created before the sync-run schema.
+
+        LanceDB tables keep their schema after creation, so merely changing the
+        schema returned by ``sync_runs_schema`` is not enough for an existing
+        database.  The old implementation only recorded completed runs; those
+        rows are therefore migrated as successful backfill runs.
+        """
+        table = self._get_table(SYNC_RUNS_TABLE)
+        expected = sync_runs_schema()
+        existing = set(table.schema.names)
+        missing = [field for field in expected if field.name not in existing]
+        if not missing or self.read_only:
+            return
+
+        table.add_columns(missing)
+        defaults: dict[str, Any] = {}
+        missing_names = {field.name for field in missing}
+        if "status" in missing_names:
+            defaults["status"] = "success"
+        if "mode" in missing_names:
+            defaults["mode"] = "backfill"
+        if "error" in missing_names:
+            defaults["error"] = ""
+        if defaults and not table.search().to_pandas().empty:
+            table.update(where="run_id IS NOT NULL", values=defaults)
 
     def _get_table(self, name: str):
         if name not in self._tables:
@@ -249,22 +280,35 @@ class WorkTrackDB:
     def record_sync_run(
         self,
         *,
-        since_days: int,
+        since_days: int | None,
         thread_count: int,
         event_count: int,
         new_count: int,
         warnings: list[str],
+        status: str = "success",
+        mode: str = "backfill",
+        cutoff_at: datetime | None = None,
+        error: str | None = None,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
     ) -> str:
+        self._validate_sync_run_values(status=status, mode=mode)
         run_id = uuid.uuid4().hex
         started = started_at or datetime.now(timezone.utc)
-        finished = finished_at or datetime.now(timezone.utc)
+        finished = (
+            None
+            if status == "running" and finished_at is None
+            else finished_at or datetime.now(timezone.utc)
+        )
         row = {
             "run_id": run_id,
             "started_at": pd.Timestamp(started).floor("ms"),
-            "finished_at": pd.Timestamp(finished).floor("ms"),
-            "since_days": int(since_days),
+            "finished_at": self._timestamp(finished),
+            "status": status,
+            "mode": mode,
+            "cutoff_at": self._timestamp(cutoff_at),
+            "error": str(error) if error is not None else "",
+            "since_days": None if since_days is None else int(since_days),
             "thread_count": int(thread_count),
             "event_count": int(event_count),
             "new_count": int(new_count),
@@ -272,6 +316,95 @@ class WorkTrackDB:
         }
         self._get_table(SYNC_RUNS_TABLE).add([row])
         return run_id
+
+    def start_sync_run(
+        self,
+        *,
+        since_days: int | None,
+        mode: str = "backfill",
+        cutoff_at: datetime | None = None,
+        started_at: datetime | None = None,
+    ) -> str:
+        return self.record_sync_run(
+            since_days=since_days,
+            thread_count=0,
+            event_count=0,
+            new_count=0,
+            warnings=[],
+            status="running",
+            mode=mode,
+            cutoff_at=cutoff_at,
+            started_at=started_at,
+        )
+
+    def update_sync_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        thread_count: int | None = None,
+        event_count: int | None = None,
+        new_count: int | None = None,
+        warnings: list[str] | None = None,
+        error: str | None = None,
+        finished_at: datetime | None = None,
+    ) -> None:
+        self._validate_sync_run_values(status=status, mode=None)
+        values: dict[str, Any] = {"status": status}
+        if thread_count is not None:
+            values["thread_count"] = int(thread_count)
+        if event_count is not None:
+            values["event_count"] = int(event_count)
+        if new_count is not None:
+            values["new_count"] = int(new_count)
+        if warnings is not None:
+            values["warnings"] = json.dumps(warnings, ensure_ascii=False)
+        if error is not None:
+            values["error"] = str(error)
+        if finished_at is not None or status != "running":
+            values["finished_at"] = self._timestamp(
+                finished_at or datetime.now(timezone.utc)
+            )
+
+        result = self._get_table(SYNC_RUNS_TABLE).update(
+            where=f"run_id = '{_escape_sql(run_id)}'",
+            values=values,
+        )
+        if result.rows_updated != 1:
+            raise ValueError(f"sync run not found: {run_id}")
+
+    def last_successful_sync(self) -> datetime | None:
+        table = self._get_table(SYNC_RUNS_TABLE)
+        columns = set(table.schema.names)
+        rows = table.search().to_pandas()
+        if rows.empty:
+            return None
+        if "status" in columns:
+            rows = rows[rows["status"] == "success"]
+        if rows.empty:
+            return None
+        finished = rows["finished_at"].dropna()
+        if finished.empty:
+            return None
+        timestamp = pd.Timestamp(finished.max())
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return timestamp.to_pydatetime()
+
+    @staticmethod
+    def _timestamp(value: datetime | None) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        return pd.Timestamp(value).floor("ms")
+
+    @staticmethod
+    def _validate_sync_run_values(*, status: str, mode: str | None) -> None:
+        if status not in SYNC_STATUSES:
+            raise ValueError(f"invalid sync run status: {status}")
+        if mode is not None and mode not in SYNC_MODES:
+            raise ValueError(f"invalid sync run mode: {mode}")
 
     def stats(self) -> dict[str, Any]:
         return {

@@ -1,5 +1,5 @@
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -70,6 +70,55 @@ def test_record_sync_run(db: WorkTrackDB):
         event_count=10,
         new_count=4,
         warnings=["demo"],
+        status="success",
+        mode="backfill",
     )
     assert run_id
     assert db.count_sync_runs() == 1
+
+
+def test_record_sync_run_saves_status_fields(db: WorkTrackDB):
+    cutoff_at = datetime(2026, 9, 15, 11, 30, tzinfo=timezone.utc)
+    run_id = db.record_sync_run(
+        since_days=0,
+        thread_count=1,
+        event_count=2,
+        new_count=2,
+        warnings=[],
+        status="failed",
+        mode="incremental",
+        cutoff_at=cutoff_at,
+        error="GitHub API unavailable",
+    )
+
+    row = db._get_table("sync_runs").search().where(f"run_id = '{run_id}'").to_list()[0]
+    assert row["status"] == "failed"
+    assert row["mode"] == "incremental"
+    assert row["error"] == "GitHub API unavailable"
+    assert row["cutoff_at"] == cutoff_at.replace(microsecond=0, tzinfo=None)
+
+
+def test_last_successful_sync_ignores_failed_runs(db: WorkTrackDB):
+    earlier = datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc)
+    later_failed = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    db.record_sync_run(
+        since_days=1,
+        thread_count=1,
+        event_count=1,
+        new_count=1,
+        warnings=[],
+        status="success",
+        finished_at=earlier,
+    )
+    db.record_sync_run(
+        since_days=1,
+        thread_count=1,
+        event_count=1,
+        new_count=0,
+        warnings=[],
+        status="failed",
+        error="network error",
+        finished_at=later_failed,
+    )
+
+    assert db.last_successful_sync() == earlier

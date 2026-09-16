@@ -118,51 +118,60 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command in {"collect", "sync"}:
-            open_session(args.db, read_only=False)
+            session = open_session(args.db, read_only=False)
             started = datetime.now(timezone.utc)
-            events, warnings, thread_count = collect_event_records(args.since)
-            new_count, total_count = save_events(events)
-            if args.json:
-                print(
-                    json.dumps(
-                        {
-                            "since_days": args.since,
-                            "thread_count": thread_count,
-                            "event_count": len(events),
-                            "new_count": new_count,
-                            "total_count": total_count,
-                            "db_path": str(db_path(args.db)),
-                            "warnings": warnings,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-            else:
-                print(
-                    format_collect_markdown(
-                        args.since,
-                        len(events),
-                        new_count,
-                        total_count,
-                        thread_count,
-                        warnings,
-                    )
-                )
-            open_session(args.db, read_only=False).db.record_sync_run(
+            run_id = session.db.start_sync_run(
                 since_days=args.since,
-                thread_count=thread_count,
-                event_count=len(events),
-                new_count=new_count,
-                warnings=warnings,
+                mode="backfill",
                 started_at=started,
-                finished_at=datetime.now(timezone.utc),
             )
+            try:
+                events, warnings, thread_count = collect_event_records(args.since)
+                new_count, total_count = save_events(events)
+                payload = {
+                    "since_days": args.since,
+                    "thread_count": thread_count,
+                    "event_count": len(events),
+                    "new_count": new_count,
+                    "total_count": total_count,
+                    "db_path": str(db_path(args.db)),
+                    "warnings": warnings,
+                }
+                markdown = format_collect_markdown(
+                    args.since,
+                    len(events),
+                    new_count,
+                    total_count,
+                    thread_count,
+                    warnings,
+                )
+                session.db.update_sync_run(
+                    run_id,
+                    status="success",
+                    thread_count=thread_count,
+                    event_count=len(events),
+                    new_count=new_count,
+                    warnings=warnings,
+                    error="",
+                    finished_at=datetime.now(timezone.utc),
+                )
+                if args.json:
+                    print(json.dumps(payload, ensure_ascii=False, indent=2))
+                else:
+                    print(markdown)
+            except Exception as exc:
+                session.db.update_sync_run(
+                    run_id,
+                    status="failed",
+                    error=str(exc) or exc.__class__.__name__,
+                    finished_at=datetime.now(timezone.utc),
+                )
+                raise
             return 0
 
         open_session(args.db, read_only=_read_only_for(args))
         return args.func(args)
-    except (RuntimeError, ValueError) as exc:
+    except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
