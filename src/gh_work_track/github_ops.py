@@ -36,6 +36,9 @@ from gh_work_track.session import get_session
 DEFAULT_REPO = "plaidev/karte-io-systems"
 SYNC_BOOTSTRAP_DAYS = 7
 SYNC_OVERLAP_MINUTES = 5
+SYNC_SINCE_HELP = (
+    "バックフィル専用。省略時は前回成功 sync 以降の incremental（初回は 7 日 bootstrap）"
+)
 MINE_REPOS = [
     "plaidev/karte-io-systems",
     "plaidev/karte-io-systems-ops",
@@ -580,6 +583,18 @@ def resolve_sync_cutoff(
     return current - timedelta(days=SYNC_BOOTSTRAP_DAYS), "incremental"
 
 
+def sync_output_metadata(
+    *, mode: str, cutoff: datetime, watermark: datetime | None
+) -> dict[str, Any]:
+    """Build the public metadata shared by text and JSON sync output."""
+    return {
+        "mode": mode,
+        "cutoff": since_iso(cutoff),
+        "watermark": since_iso(watermark) if watermark is not None else None,
+        "bootstrap": mode == "incremental" and watermark is None,
+    }
+
+
 def search_thread_ref(item: dict[str, Any], kind_hint: str) -> ThreadRef | None:
     repository = item.get("repository")
     repo = ""
@@ -787,6 +802,8 @@ def format_collect_markdown(
     *,
     mode: str = "backfill",
     cutoff: datetime | None = None,
+    watermark: datetime | None = None,
+    bootstrap: bool = False,
 ) -> str:
     lines = [f"## gh-work-track collect ({datetime.now().strftime('%Y-%m-%d %H:%M')})", ""]
     if mode == "incremental" and cutoff is not None:
@@ -795,7 +812,13 @@ def format_collect_markdown(
         period = f"直近 {since_days} 日"
     else:
         period = "指定された cutoff 以降"
-    lines.append(f"モード: {mode} / 期間: {period} / 対象スレッド: {thread_count} 件")
+    cutoff_text = since_iso(cutoff) if cutoff is not None else "null"
+    watermark_text = since_iso(watermark) if watermark is not None else "null"
+    lines.append(
+        f"mode: {mode} / cutoff: {cutoff_text} / "
+        f"watermark: {watermark_text} / bootstrap: {str(bootstrap).lower()}"
+    )
+    lines.append(f"期間: {period} / 対象スレッド: {thread_count} 件")
     lines.append(f"取得イベント: {event_count} 件 / 新規保存: {new_count} 件 / 累積: {total_count} 件")
     lines.append(f"保存先: `{default_db_path()}`")
     if warnings:
@@ -1001,12 +1024,17 @@ def cmd_collect(args: argparse.Namespace) -> int:
         last_successful_sync=last_successful,
         now=now,
     )
+    metadata = sync_output_metadata(
+        mode=mode,
+        cutoff=cutoff,
+        watermark=last_successful,
+    )
     events, warnings, thread_count = collect_event_records(cutoff=cutoff)
     new_count, total_count = save_events(events)
     if args.json:
         print(json.dumps({
-            "mode": mode,
-            "cutoff_at": cutoff.isoformat(),
+            **metadata,
+            "cutoff_at": metadata["cutoff"],
             "since_days": args.since,
             "thread_count": thread_count,
             "event_count": len(events),
@@ -1025,6 +1053,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
             warnings,
             mode=mode,
             cutoff=cutoff,
+            watermark=last_successful,
+            bootstrap=metadata["bootstrap"],
         ))
     return 0
 
@@ -1215,12 +1245,12 @@ def build_parser() -> argparse.ArgumentParser:
     lp.set_defaults(func=cmd_list)
 
     cp = sub.add_parser("collect", help="自分に関するイベントを取得して保存（sync の別名）")
-    cp.add_argument("--since", type=int, help="イベントを遡る日数（指定時は backfill。未指定は incremental）")
+    cp.add_argument("--since", type=int, help=SYNC_SINCE_HELP)
     cp.add_argument("--json", action="store_true")
     cp.set_defaults(func=cmd_collect)
 
     sp = sub.add_parser("sync", help="GitHub からイベントを同期")
-    sp.add_argument("--since", type=int, help="イベントを遡る日数（指定時は backfill。未指定は incremental）")
+    sp.add_argument("--since", type=int, help=SYNC_SINCE_HELP)
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_collect)
 

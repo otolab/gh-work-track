@@ -32,16 +32,35 @@ LanceDB 本体: `$GH_WORK_TRACK_HOME/lance/`
 
 ## 使い方
 
+### Quick start（incremental 前提）
+
 ```bash
-# 初回
+# セットアップ
 uv run gh-work-track init
 uv run gh-work-track migrate
 
-# 同期（通常は前回成功時刻からの incremental）
+# 日常運用: 前回成功 sync 以降だけを同期
 uv run gh-work-track sync
-# 任意期間を取り直す backfill（watermark は無視）
-uv run gh-work-track sync --since 1
 uv run gh-work-track daily --date 2026-09-15
+```
+
+通常の `sync` は incremental モードで動作し、前回成功した sync の `finished_at` を watermark として、その時刻の少し前から取得します。初回は bootstrap として直近 7 日を対象にします。
+
+### 日常運用: `sync`
+
+引数なしの `sync` を定期的に実行してください。境界付近の取りこぼしを防ぐため、前回成功 sync の時刻より 5 分前から取得する overlap buffer（`SYNC_OVERLAP_MINUTES=5`）を使います。重複したイベントは `dedup_key` で統合されます。
+
+GitHub 側の discovery や通知が遅れてスレッドに載る場合は、次回の `sync` で拾います。
+
+### 修復・初回: `sync --since N`
+
+任意期間を取り直すときや初回のバックフィルには `sync --since N` を使います。これは backfill 専用で、watermark を使わず直近 `N` 日（`N >= 1`）を取得します。完了後の日常運用は、引数なしの `sync` に戻してください。
+
+`collect` は `sync` の別名です。どちらも同じ incremental / backfill の動作と出力メタデータを持ちます。
+
+```bash
+# 修復・初回のバックフィル例
+uv run gh-work-track sync --since 7
 
 # 一覧・深堀り
 uv run gh-work-track list --since 7

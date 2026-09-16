@@ -20,6 +20,7 @@ from gh_work_track.github_ops import (
     format_collect_markdown,
     resolve_sync_cutoff,
     save_events,
+    sync_output_metadata,
 )
 from gh_work_track.migrate import migrate_legacy
 from gh_work_track.session import open_session
@@ -131,6 +132,11 @@ def main(argv: list[str] | None = None) -> int:
                 last_successful_sync=last_successful,
                 now=started,
             )
+            metadata = sync_output_metadata(
+                mode=mode,
+                cutoff=cutoff,
+                watermark=last_successful,
+            )
             run_id = session.db.start_sync_run(
                 since_days=args.since,
                 mode=mode,
@@ -141,8 +147,8 @@ def main(argv: list[str] | None = None) -> int:
                 events, warnings, thread_count = collect_event_records(cutoff=cutoff)
                 new_count, total_count = save_events(events)
                 payload = {
-                    "mode": mode,
-                    "cutoff_at": cutoff.isoformat(),
+                    **metadata,
+                    "cutoff_at": metadata["cutoff"],
                     "since_days": args.since,
                     "thread_count": thread_count,
                     "event_count": len(events),
@@ -160,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
                     warnings,
                     mode=mode,
                     cutoff=cutoff,
+                    watermark=last_successful,
+                    bootstrap=metadata["bootstrap"],
                 )
                 session.db.update_sync_run(
                     run_id,
