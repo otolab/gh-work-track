@@ -201,6 +201,7 @@ class WorkTrackDB:
         kind: str = "issue",
         title: str = "",
         watch_note: str = "",
+        is_watched: bool = False,
         last_seen_at: str = "",
         last_synced_at: str = "",
     ) -> None:
@@ -210,6 +211,7 @@ class WorkTrackDB:
             "number": int(number),
             "kind": kind,
             "title": title,
+            "is_watched": bool(is_watched),
             "watch_note": watch_note,
             "last_seen_at": last_seen_at,
             "last_synced_at": last_synced_at,
@@ -220,9 +222,26 @@ class WorkTrackDB:
             [row]
         )
 
+    def get_thread(self, repo: str, number: int) -> dict[str, Any] | None:
+        key = thread_key(repo, number)
+        rows = (
+            self._get_table(THREADS_TABLE)
+            .search()
+            .where(f"thread_key = '{_escape_sql(key)}'")
+            .limit(1)
+            .to_list()
+        )
+        return rows[0] if rows else None
+
+    def is_new_since_seen(self, repo: str, number: int, updated_at: str) -> bool:
+        existing = self.get_thread(repo, number)
+        if not existing or not existing.get("last_seen_at"):
+            return True
+        return updated_at > str(existing["last_seen_at"])
+
     def list_watched_threads(self) -> list[dict[str, Any]]:
         table = self._get_table(THREADS_TABLE)
-        df = table.search().where("watch_note != ''").to_pandas()
+        df = table.search().where("is_watched = true").to_pandas()
         if df.empty:
             return []
         return df.sort_values("thread_key").to_dict(orient="records")

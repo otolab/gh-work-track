@@ -38,6 +38,7 @@ def threads_schema() -> pa.Schema:
             pa.field("number", pa.int32()),
             pa.field("kind", pa.string()),
             pa.field("title", pa.string()),
+            pa.field("is_watched", pa.bool_()),
             pa.field("watch_note", pa.string()),
             pa.field("last_seen_at", pa.string()),
             pa.field("last_synced_at", pa.string()),

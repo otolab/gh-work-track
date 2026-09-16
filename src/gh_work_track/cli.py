@@ -3,34 +3,45 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, timedelta
+from datetime import datetime, timezone
+from pathlib import Path
 
 from gh_work_track import __version__
 from gh_work_track.config import data_home, db_path
-from gh_work_track.db import WorkTrackDB
+from gh_work_track.github_ops import (
+    build_parser as build_github_parser,
+    cmd_collect,
+    cmd_daily,
+    cmd_drill,
+    cmd_list,
+    cmd_mark_seen,
+    cmd_watch,
+    collect_event_records,
+    format_collect_markdown,
+    save_events,
+)
+from gh_work_track.migrate import migrate_legacy
+from gh_work_track.session import open_session
+
+DEFAULT_LEGACY_DIR = Path.home() / "Develop/otolab/my-logs/.claude/skills/gh-work-track"
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    db = WorkTrackDB(args.db, read_only=False)
-    db.init_tables()
-    print(json.dumps(db.stats(), ensure_ascii=False, indent=2))
+    session = open_session(args.db, read_only=False)
+    print(json.dumps(session.db.stats(), ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    db = WorkTrackDB(args.db, read_only=args.read_only)
-    db.init_tables()
-    print(json.dumps(db.stats(), ensure_ascii=False, indent=2))
+    session = open_session(args.db, read_only=args.read_only)
+    print(json.dumps(session.db.stats(), ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_paths(_: argparse.Namespace) -> int:
     print(
         json.dumps(
-            {
-                "data_home": str(data_home()),
-                "db_path": str(db_path()),
-            },
+            {"data_home": str(data_home()), "db_path": str(db_path())},
             ensure_ascii=False,
             indent=2,
         )
@@ -38,92 +49,118 @@ def cmd_paths(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_daily(args: argparse.Namespace) -> int:
-    db = WorkTrackDB(args.db, read_only=True)
-    db.init_tables()
-    if args.date:
-        events = db.events_for_date(args.date)
-        period = args.date
-    else:
-        end = date.today()
-        start = end - timedelta(days=args.since - 1)
-        events = db.events_between(start.isoformat(), end.isoformat())
-        period = f"{start.isoformat()} ～ {end.isoformat()}"
+def cmd_migrate(args: argparse.Namespace) -> int:
+    legacy = Path(args.legacy_dir)
+    session = open_session(args.db, read_only=False)
+    result = migrate_legacy(
+        session,
+        events_jsonl=legacy / ".events" / "events.jsonl" if args.events else None,
+        watch_json=legacy / ".watch.json" if args.watch else None,
+        state_json=legacy / ".state.json" if args.state else None,
+    )
     if args.json:
-        print(json.dumps({"period": period, "count": len(events), "events": events}, ensure_ascii=False, indent=2))
-        return 0
-    print(f"## gh-work-track daily ({period})")
-    print()
-    print(f"イベント: {len(events)} 件")
-    print()
-    if not events:
-        print("_該当なし（先に `sync` を実行してください — 未実装）_")
-        return 0
-    current_date = ""
-    for event in events:
-        event_day = str(event.get("date", ""))
-        if event_day != current_date:
-            if current_date:
-                print()
-            print(f"### {event_day}")
-            current_date = event_day
-        actor = str(event.get("actor", ""))
-        actor_text = f" by @{actor}" if actor and actor != "?" else ""
-        body = f" — {event['snippet']}" if event.get("snippet") else ""
-        print(
-            f"- `{event.get('repo', '?')}#{event.get('number', '?')}` "
-            f"({event.get('kind', 'issue')}) **{event.get('event', 'event')}**"
-            f"{actor_text}{body} — {event.get('url', '')}"
-        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print("## migrate")
+        print(f"- events: {result['events']} 件")
+        print(f"- watch: {result['watch']} 件")
+        print(f"- state: {result['state']} 件")
+        print(f"- db: `{session.db.path}`")
     return 0
 
 
-def cmd_sync(_: argparse.Namespace) -> int:
-    print(
-        "error: `sync` は未実装です。GitHub API 同期は次フェーズで my-logs プロトタイプから移植します。",
-        file=sys.stderr,
-    )
-    return 2
+def cmd_sync(args: argparse.Namespace) -> int:
+    return cmd_collect(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="GitHub work event tracker (LanceDB)",
-    )
+    parser = build_github_parser()
+    parser.description = "GitHub work event tracker (LanceDB)"
     parser.add_argument("--version", action="version", version=f"gh-work-track {__version__}")
-    parser.add_argument(
-        "--db",
-        help="LanceDB ディレクトリ（default: ~/.local/share/gh-work-track/lance）",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub = next(action for action in parser._actions if action.dest == "command")
 
     init_parser = sub.add_parser("init", help="LanceDB テーブルを初期化")
     init_parser.set_defaults(func=cmd_init)
 
     stats_parser = sub.add_parser("stats", help="DB 統計を表示")
-    stats_parser.add_argument("--read-only", action="store_true", help="read_consistency_interval=5s で接続")
+    stats_parser.add_argument("--read-only", action="store_true")
     stats_parser.set_defaults(func=cmd_stats)
 
     paths_parser = sub.add_parser("paths", help="データディレクトリを表示")
     paths_parser.set_defaults(func=cmd_paths)
 
-    daily_parser = sub.add_parser("daily", help="保存済みイベントを日付 pivot")
-    daily_period = daily_parser.add_mutually_exclusive_group(required=True)
-    daily_period.add_argument("--date", help="対象日 (YYYY-MM-DD, UTC 暦日)")
-    daily_period.add_argument("--since", type=int, help="直近 N 暦日（今日を含む）")
-    daily_parser.add_argument("--json", action="store_true")
-    daily_parser.set_defaults(func=cmd_daily)
-
-    sync_parser = sub.add_parser("sync", help="GitHub からイベントを同期（未実装）")
-    sync_parser.set_defaults(func=cmd_sync)
+    migrate_parser = sub.add_parser("migrate", help="my-logs プロトタイプの JSON/JSONL を取り込む")
+    migrate_parser.add_argument("--legacy-dir", default=str(DEFAULT_LEGACY_DIR))
+    migrate_parser.add_argument("--events", action=argparse.BooleanOptionalAction, default=True)
+    migrate_parser.add_argument("--watch", action=argparse.BooleanOptionalAction, default=True)
+    migrate_parser.add_argument("--state", action=argparse.BooleanOptionalAction, default=True)
+    migrate_parser.add_argument("--json", action="store_true")
+    migrate_parser.set_defaults(func=cmd_migrate)
 
     return parser
+
+
+def _read_only_for(args: argparse.Namespace) -> bool:
+    if args.command == "daily":
+        return True
+    if args.command == "list":
+        return True
+    if args.command == "watch" and args.action == "list":
+        return True
+    if args.command == "drill" and getattr(args, "no_mark_seen", False):
+        return True
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command in {"collect", "sync"}:
+            open_session(args.db, read_only=False)
+            started = datetime.now(timezone.utc)
+            events, warnings, thread_count = collect_event_records(args.since)
+            new_count, total_count = save_events(events)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "since_days": args.since,
+                            "thread_count": thread_count,
+                            "event_count": len(events),
+                            "new_count": new_count,
+                            "total_count": total_count,
+                            "db_path": str(db_path(args.db)),
+                            "warnings": warnings,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            else:
+                print(
+                    format_collect_markdown(
+                        args.since,
+                        len(events),
+                        new_count,
+                        total_count,
+                        thread_count,
+                        warnings,
+                    )
+                )
+            open_session(args.db, read_only=False).db.record_sync_run(
+                since_days=args.since,
+                thread_count=thread_count,
+                event_count=len(events),
+                new_count=new_count,
+                warnings=warnings,
+                started_at=started,
+                finished_at=datetime.now(timezone.utc),
+            )
+            return 0
+
+        open_session(args.db, read_only=_read_only_for(args))
         return args.func(args)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

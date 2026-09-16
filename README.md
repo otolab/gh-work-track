@@ -8,9 +8,10 @@
 
 | 機能 | 状態 |
 |---|---|
-| LanceDB スキーマ / `init` / `stats` / `daily` | ✅ v0.1 |
-| GitHub `sync`（notifications + watch + search → events） | 🔜 移植予定 |
-| `watch` / `list` / `drill` | 🔜 |
+| LanceDB スキーマ / `init` / `stats` / `daily` | ✅ |
+| `sync` / `collect`（notifications + watch + search → events） | ✅ |
+| `watch` / `list` / `drill` / `mark-seen` | ✅ |
+| `migrate`（my-logs プロトタイプ JSONL → LanceDB） | ✅ |
 | modular-prompt-extract 連携 | 🔜 別途 |
 
 ## インストール
@@ -32,21 +33,19 @@ LanceDB 本体: `$GH_WORK_TRACK_HOME/lance/`
 ## 使い方
 
 ```bash
-# 初回: テーブル作成
+# 初回
 uv run gh-work-track init
+uv run gh-work-track migrate
 
-# 統計
-uv run gh-work-track stats
-
-# パス確認
-uv run gh-work-track paths
-
-# 日次一覧（DB にイベントがある場合）
+# 同期・日次
+uv run gh-work-track sync --since 1
 uv run gh-work-track daily --date 2026-09-15
-uv run gh-work-track daily --since 7 --json
-```
 
-`sync` は次フェーズで実装予定。現状は DB レイヤと `daily` クエリのみ。
+# 一覧・深堀り
+uv run gh-work-track list --since 7
+uv run gh-work-track drill 170102
+uv run gh-work-track watch list
+```
 
 ## LanceDB 設計（search-docs 踏襲）
 

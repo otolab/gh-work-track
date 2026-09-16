@@ -56,8 +56,8 @@ def test_events_for_date_and_between(db: WorkTrackDB):
 
 
 def test_thread_upsert_and_watch_filter(db: WorkTrackDB):
-    db.upsert_thread("otolab/my-logs", 2049, watch_note="work")
-    db.upsert_thread("otolab/my-logs", 1, watch_note="")
+    db.upsert_thread("otolab/my-logs", 2049, watch_note="work", is_watched=True)
+    db.upsert_thread("otolab/my-logs", 1, watch_note="", is_watched=False)
     watched = db.list_watched_threads()
     assert len(watched) == 1
     assert watched[0]["thread_key"] == thread_key("otolab/my-logs", 2049)
