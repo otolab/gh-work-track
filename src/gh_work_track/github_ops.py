@@ -82,6 +82,14 @@ class ThreadRef:
         return f"https://github.com/{self.repo}/{path}/{self.number}"
 
 
+@dataclass(frozen=True)
+class ThreadSyncBoundary:
+    """The start boundary of one thread's GitHub collection attempt."""
+
+    ref: ThreadRef
+    started_at: datetime
+
+
 @dataclass
 class ThreadSummary:
     ref: ThreadRef
@@ -483,6 +491,17 @@ def _timeline_page_is_before(page: list[dict[str, Any]], cutoff: datetime) -> bo
     return timestamps is not None and all(timestamp < cutoff for timestamp in timestamps)
 
 
+def _timeline_has_unknown_commented_activity(
+    timeline: list[dict[str, Any]],
+) -> bool:
+    return any(
+        isinstance(item, dict)
+        and str(item.get("event", "")).strip() == "commented"
+        and _timeline_timestamp(item) is None
+        for item in timeline
+    )
+
+
 def fetch_timeline(
     ref: ThreadRef,
     per_page: int = 30,
@@ -505,11 +524,12 @@ def fetch_timeline(
             break
         events.extend(item for item in page if isinstance(item, dict))
         page_order = _timeline_page_order(page)
-        if page_order is not None:
-            if order is None:
-                order = page_order
-            elif order != page_order:
-                order = "unknown"
+        if page_order is None:
+            order = "unknown"
+        elif order is None:
+            order = page_order
+        elif order != page_order:
+            order = "unknown"
         if order == "descending" and _timeline_page_is_before(page, normalized_cutoff):
             break
         if len(page) < per_page:
@@ -775,7 +795,7 @@ def collect_event_records(
     since_days: int | None = None,
     overlap_minutes: int = SYNC_OVERLAP_MINUTES,
     optimize_threads: bool | None = None,
-    synced_threads: list[ThreadRef] | None = None,
+    synced_threads: list[ThreadSyncBoundary] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
     """Collect events at or after the effective sync cutoff.
 
@@ -854,6 +874,7 @@ def collect_event_records(
             events.append(record)
 
     for ref_key, ref in refs.items():
+        thread_sync_started_at = datetime.now(timezone.utc)
         thread_cutoff = (
             effective_thread_cutoff(ref, cutoff)
             if optimize_threads
@@ -879,7 +900,8 @@ def collect_event_records(
         has_recent_timeline_activity = any(
             event_is_since(event, thread_cutoff) for event in thread_events
         )
-        if has_recent_timeline_activity:
+        has_unknown_commented_activity = _timeline_has_unknown_commented_activity(timeline)
+        if has_recent_timeline_activity or has_unknown_commented_activity:
             try:
                 comments = fetch_all_comments(ref)
             except RuntimeError as exc:
@@ -901,7 +923,7 @@ def collect_event_records(
             )
         events.extend(thread_events)
         if synced_threads is not None:
-            synced_threads.append(ref)
+            synced_threads.append(ThreadSyncBoundary(ref, thread_sync_started_at))
 
     return deduplicate_events(events), warnings, len(refs)
 
@@ -1143,7 +1165,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         cutoff=cutoff,
         watermark=last_successful,
     )
-    synced_threads: list[ThreadRef] = []
+    synced_threads: list[ThreadSyncBoundary] = []
     events, warnings, thread_count = collect_event_records(
         cutoff=cutoff,
         optimize_threads=mode == "incremental",
