@@ -902,6 +902,7 @@ def fetch_search_threads(
     queries = [
         ("issues", "author"),
         ("issues", "assignee"),
+        ("issues", "commenter"),
         ("prs", "author"),
         ("prs", "assignee"),
         ("prs", "reviewed-by"),

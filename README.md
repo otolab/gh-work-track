@@ -64,7 +64,7 @@ sync:
 
 `sync` は `gh search` のグローバル検索を主経路として、次の条件を直近の更新日時に適用します。
 
-- Issue: `author` / `assignee`
+- Issue: `author` / `assignee` / `commenter`
 - Pull request: `author` / `assignee` / `reviewed-by` / `commenter`
 
 `search_orgs` を設定すると organization ごとに検索し、設定しない場合は全 organization が対象です。グローバル検索の結果に加えて、`mine_repos` に設定した repo も従来型の per-repo 検索で確認し、重複を統合します。

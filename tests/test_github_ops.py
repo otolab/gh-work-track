@@ -278,10 +278,10 @@ def test_search_discovery_uses_configured_mine_repos(monkeypatch, tmp_path):
     refs, warnings = github_ops.fetch_search_threads("2026-09-17")
 
     assert refs == []
-    assert len(warnings) == 18
+    assert len(warnings) == 21
     assert all("0 results" in warning for warning in warnings)
-    assert len(calls) == 18
-    assert len([args for args in calls if "--repo" not in args]) == 6
+    assert len(calls) == 21
+    assert len([args for args in calls if "--repo" not in args]) == 7
     assert {
         args[args.index("--repo") + 1]
         for args in calls
@@ -328,17 +328,23 @@ def test_global_search_unions_threads_from_multiple_repositories(monkeypatch, tm
         "plaidev/karte-io-deploy#42",
     }
     assert {ref.kind for ref in refs} == {"issue", "pr"}
-    assert len(calls) == 6
+    assert len(calls) == 7
     assert all("--repo" not in args for args in calls)
     assert all(not any(arg.startswith("org:") for arg in args) for args in calls)
-    assert all(
-        any(
-            qualifier in args
-            for qualifier in ("--author", "--assignee", "--reviewed-by", "--commenter")
-        )
+    qualifiers = ("--author", "--assignee", "--reviewed-by", "--commenter")
+    assert {
+        (args[1], next(arg for arg in args if arg in qualifiers))
         for args in calls
-    )
-    assert len(warnings) == 6
+    } == {
+        ("issues", "--author"),
+        ("issues", "--assignee"),
+        ("issues", "--commenter"),
+        ("prs", "--author"),
+        ("prs", "--assignee"),
+        ("prs", "--reviewed-by"),
+        ("prs", "--commenter"),
+    }
+    assert len(warnings) == 7
 
 
 def test_global_search_applies_configured_organization_qualifier(monkeypatch, tmp_path):
@@ -357,7 +363,7 @@ def test_global_search_applies_configured_organization_qualifier(monkeypatch, tm
 
     github_ops.fetch_search_threads("2026-09-17")
 
-    assert len(calls) == 12
+    assert len(calls) == 14
     assert {args[2] for args in calls} == {"org:plaidev", "org:otolab"}
     assert all("--repo" not in args for args in calls)
 
@@ -384,7 +390,7 @@ def test_search_retries_rate_limit_using_retry_after(monkeypatch, tmp_path):
     )
 
     assert refs == []
-    assert len(calls) == 7
+    assert len(calls) == 8
     assert sleeps == [pytest.approx(7)]
     assert any("retrying" in warning for warning in warnings)
 
@@ -419,7 +425,7 @@ def test_backfill_searches_are_spaced(monkeypatch, tmp_path):
 
     github_ops.fetch_search_threads("2026-09-17", backfill=True)
 
-    assert len(sleeps) == 5
+    assert len(sleeps) == 6
     assert all(delay == pytest.approx(2.0, abs=0.1) for delay in sleeps)
 
 
