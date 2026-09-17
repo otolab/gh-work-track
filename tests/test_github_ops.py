@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from gh_work_track import github_ops
 from gh_work_track.config import CONFIG_ENV
 from gh_work_track.db import WorkTrackDB
@@ -126,7 +128,7 @@ def test_unknown_commented_activity_keeps_comments_fallback(monkeypatch, tmp_pat
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: ([ref], []),
+        lambda cutoff_date, **kwargs: ([ref], []),
     )
     monkeypatch.setattr(
         github_ops,
@@ -176,7 +178,7 @@ def test_thread_start_boundary_keeps_events_created_during_collection(
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: ([ref], []),
+        lambda cutoff_date, **kwargs: ([ref], []),
     )
 
     def fetch_timeline(*args, **kwargs):
@@ -276,12 +278,149 @@ def test_search_discovery_uses_configured_mine_repos(monkeypatch, tmp_path):
     refs, warnings = github_ops.fetch_search_threads("2026-09-17")
 
     assert refs == []
-    assert warnings == []
-    assert len(calls) == 10
+    assert len(warnings) == 18
+    assert all("0 results" in warning for warning in warnings)
+    assert len(calls) == 18
+    assert len([args for args in calls if "--repo" not in args]) == 6
     assert {
         args[args.index("--repo") + 1]
         for args in calls
+        if "--repo" in args
     } == {"example/one", "example/two"}
+
+
+def test_global_search_unions_threads_from_multiple_repositories(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("mine_repos: []\n", encoding="utf-8")
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+    calls: list[list[str]] = []
+
+    def fake_search(args):
+        calls.append(args)
+        if args[1] == "issues":
+            return [
+                {
+                    "number": 12,
+                    "repository": {"nameWithOwner": "otolab/gh-work-track"},
+                    "url": "https://github.com/otolab/gh-work-track/issues/12",
+                },
+                {
+                    "number": 42,
+                    "repository": {"nameWithOwner": "plaidev/karte-io-deploy"},
+                    "url": "https://github.com/plaidev/karte-io-deploy/issues/42",
+                },
+            ]
+        return [
+            {
+                "number": 13,
+                "repository": {"nameWithOwner": "otolab/gh-work-track"},
+                "url": "https://github.com/otolab/gh-work-track/pull/13",
+            }
+        ]
+
+    monkeypatch.setattr(github_ops, "gh_cli_json", fake_search)
+
+    refs, warnings = github_ops.fetch_search_threads("2026-09-17")
+
+    assert {ref.key for ref in refs} == {
+        "otolab/gh-work-track#12",
+        "otolab/gh-work-track#13",
+        "plaidev/karte-io-deploy#42",
+    }
+    assert {ref.kind for ref in refs} == {"issue", "pr"}
+    assert len(calls) == 6
+    assert all("--repo" not in args for args in calls)
+    assert all(not any(arg.startswith("org:") for arg in args) for args in calls)
+    assert all(
+        any(
+            qualifier in args
+            for qualifier in ("--author", "--assignee", "--reviewed-by", "--commenter")
+        )
+        for args in calls
+    )
+    assert len(warnings) == 6
+
+
+def test_global_search_applies_configured_organization_qualifier(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "mine_repos: []\nsearch_orgs:\n  - plaidev\n  - otolab\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        github_ops,
+        "gh_cli_json",
+        lambda args: calls.append(args) or [],
+    )
+
+    github_ops.fetch_search_threads("2026-09-17")
+
+    assert len(calls) == 12
+    assert {args[2] for args in calls} == {"org:plaidev", "org:otolab"}
+    assert all("--repo" not in args for args in calls)
+
+
+def test_search_retries_rate_limit_using_retry_after(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("mine_repos: []\n", encoding="utf-8")
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def fake_search(args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise RuntimeError("HTTP 429: rate limit exceeded; Retry-After: 7")
+        return []
+
+    monkeypatch.setattr(github_ops, "gh_cli_json", fake_search)
+    monkeypatch.setattr(github_ops.time, "sleep", sleeps.append)
+
+    refs, warnings = github_ops.fetch_search_threads(
+        "2026-09-17",
+        backfill=False,
+    )
+
+    assert refs == []
+    assert len(calls) == 7
+    assert sleeps == [pytest.approx(7)]
+    assert any("retrying" in warning for warning in warnings)
+
+
+def test_search_rate_limit_exhaustion_raises_sync_collection_error(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("mine_repos: []\n", encoding="utf-8")
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+    calls = 0
+    monkeypatch.setattr(github_ops.time, "sleep", lambda _: None)
+
+    def fake_search(args):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("HTTP 403: rate limit exceeded; Retry-After: 0")
+
+    monkeypatch.setattr(github_ops, "gh_cli_json", fake_search)
+
+    with pytest.raises(github_ops.SyncCollectionError, match="after 4 attempts"):
+        github_ops.fetch_search_threads("2026-09-17")
+
+    assert calls == 4
+
+
+def test_backfill_searches_are_spaced(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("mine_repos: []\n", encoding="utf-8")
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+    sleeps: list[float] = []
+    monkeypatch.setattr(github_ops, "gh_cli_json", lambda args: [])
+    monkeypatch.setattr(github_ops.time, "sleep", sleeps.append)
+
+    github_ops.fetch_search_threads("2026-09-17", backfill=True)
+
+    assert len(sleeps) == 5
+    assert all(delay == pytest.approx(2.0, abs=0.1) for delay in sleeps)
 
 
 def test_sync_cutoff_uses_configured_bootstrap_and_overlap(monkeypatch, tmp_path):

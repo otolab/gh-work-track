@@ -63,6 +63,7 @@ def test_sync_passes_cli_configuration_overrides(monkeypatch, tmp_path):
         "--db", str(db_path),
         "sync",
         "--mine-repo", "cli/repo",
+        "--search-org", "cli-org",
         "--bootstrap-days", "11",
         "--overlap-minutes", "1",
     ]) == 0
@@ -70,6 +71,7 @@ def test_sync_passes_cli_configuration_overrides(monkeypatch, tmp_path):
     assert cutoff_args["bootstrap_days"] == 11
     assert cutoff_args["overlap_minutes"] == 1
     assert collect_args["mine_repos"] == ["cli/repo"]
+    assert collect_args["search_orgs"] == ["cli-org"]
 
 
 def test_sync_help_explains_incremental_and_backfill_modes(capsys):
@@ -136,6 +138,7 @@ def test_partial_collection_failure_does_not_advance_watermark(
     monkeypatch, tmp_path, failure_source, error_fragment
 ):
     db_path = tmp_path / "lance"
+    monkeypatch.setattr(github_ops, "SEARCH_INTERVAL_SECONDS", 0.0)
 
     monkeypatch.setattr(cli, "collect_event_records", lambda **kwargs: ([], [], 0))
     monkeypatch.setattr(cli, "save_events", lambda events: (0, 0))
@@ -214,7 +217,7 @@ def _mock_event_sources(monkeypatch, comments: list[dict]) -> None:
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: ([ref], []),
+        lambda cutoff_date, **kwargs: ([ref], []),
     )
     monkeypatch.setattr(
         github_ops,
@@ -272,7 +275,7 @@ def test_thread_watermark_failure_rolls_back_multiple_threads(
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: (refs, []),
+        lambda cutoff_date, **kwargs: (refs, []),
     )
     monkeypatch.setattr(
         github_ops,
@@ -340,7 +343,7 @@ def test_success_run_failure_restores_thread_watermark(
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: ([ref], []),
+        lambda cutoff_date, **kwargs: ([ref], []),
     )
     monkeypatch.setattr(
         github_ops,
@@ -572,7 +575,7 @@ def test_incremental_sync_uses_previous_run_start_for_long_run_overlap(
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: ([ref], []),
+        lambda cutoff_date, **kwargs: ([ref], []),
     )
     timeline_calls = 0
     effective_cutoffs = []
@@ -637,7 +640,7 @@ def test_incremental_sync_uses_thread_floor_and_skips_comments_when_timeline_is_
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: ([ref], []),
+        lambda cutoff_date, **kwargs: ([ref], []),
     )
 
     def fetch_old_timeline(*args, **kwargs):
@@ -680,7 +683,7 @@ def test_comments_are_fetched_when_timeline_has_recent_activity(
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
-        lambda cutoff_date: ([ref], []),
+        lambda cutoff_date, **kwargs: ([ref], []),
     )
     monkeypatch.setattr(
         github_ops,
