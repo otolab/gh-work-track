@@ -8,6 +8,7 @@ from typing import Any
 import lancedb
 import pandas as pd
 import pyarrow as pa
+from lancedb.index import BTree
 
 from gh_work_track.config import db_path
 from gh_work_track.schemas import (
@@ -125,7 +126,7 @@ class WorkTrackDB:
         if any(getattr(idx, "columns", None) == [column] for idx in existing):
             return
         try:
-            table.create_scalar_index(column, index_type=index_type)
+            table.create_index(column, config=BTree())
         except Exception:
             # インデックス作成失敗はクエリ性能に留まるため起動は継続
             return
