@@ -30,6 +30,33 @@ uv run gh-work-track --help
 
 LanceDB 本体: `$GH_WORK_TRACK_HOME/lance/`
 
+## 設定
+
+設定ファイルは `~/.config/gh-work-track/config.yaml` から読み込みます。`XDG_CONFIG_HOME` が設定されている場合は `$XDG_CONFIG_HOME/gh-work-track/config.yaml` を使い、`GH_WORK_TRACK_CONFIG` で任意のパスに変更できます。ファイルがない場合は、従来のデフォルト値を使います。
+
+```yaml
+default_repo: owner/repo
+mine_repos:
+  - owner/repo-a
+  - owner/repo-b
+sync:
+  bootstrap_days: 7
+  overlap_minutes: 5
+```
+
+`default_repo` は数字だけの ref（例: `drill 123`）の解決先です。`mine_repos` は `list` の自分の open Issue/PR と sync の search discovery の対象リポジトリです。`bootstrap_days` は watermark がない初回の incremental sync、`overlap_minutes` は前回成功 sync からの巻き戻し幅に使います。
+
+設定値ごとの環境変数と CLI フラグは次のとおりです。`--mine-repo` は複数回指定できます。`GH_WORK_TRACK_MINE_REPOS` はカンマ区切りで指定してください。
+
+| 設定 | 環境変数 | CLI フラグ |
+|---|---|---|
+| `default_repo` | `GH_WORK_TRACK_DEFAULT_REPO` | `--default-repo OWNER/REPO` |
+| `mine_repos` | `GH_WORK_TRACK_MINE_REPOS` | `--mine-repo OWNER/REPO` |
+| `sync.bootstrap_days` | `GH_WORK_TRACK_SYNC_BOOTSTRAP_DAYS` | `--bootstrap-days N` |
+| `sync.overlap_minutes` | `GH_WORK_TRACK_SYNC_OVERLAP_MINUTES` | `--overlap-minutes N` |
+
+値の優先順位は **フラグ > env > config > default** です。`sync --since N` は設定された bootstrap 日数ではなく、明示的な N 日の backfill として動作します。
+
 ## 使い方
 
 ### Quick start（incremental 前提）
@@ -44,11 +71,11 @@ uv run gh-work-track sync
 uv run gh-work-track daily --date 2026-09-15
 ```
 
-通常の `sync` は incremental モードで動作し、前回成功した sync の取得開始時刻を global cutoff の基準として、その時刻の 5 分前から取得します。前回成功 run の完了時刻は出力 metadata の `watermark` に保持します。初回は bootstrap として直近 7 日を対象にします。
+通常の `sync` は incremental モードで動作し、前回成功した sync の取得開始時刻を global cutoff の基準として、設定された overlap 分前から取得します。前回成功 run の完了時刻は出力 metadata の `watermark` に保持します。初回は設定された bootstrap 日数を対象にします。
 
 ### 日常運用: `sync`
 
-引数なしの `sync` を定期的に実行してください。境界付近の取りこぼしを防ぐため、前回成功 sync の取得開始時刻より 5 分前から取得する overlap buffer（`SYNC_OVERLAP_MINUTES=5`）を使います。重複したイベントは `dedup_key` で統合されます。
+引数なしの `sync` を定期的に実行してください。境界付近の取りこぼしを防ぐため、前回成功 sync の取得開始時刻より設定された分数前から取得する overlap buffer（デフォルト `overlap_minutes=5`）を使います。重複したイベントは `dedup_key` で統合されます。
 
 GitHub 側の discovery や通知が遅れてスレッドに載る場合は、次回の `sync` で拾います。
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from gh_work_track import github_ops
+from gh_work_track.config import CONFIG_ENV
 from gh_work_track.db import WorkTrackDB
 from gh_work_track.session import open_session
 
@@ -247,3 +248,59 @@ def test_effective_thread_cutoff_uses_global_thread_and_db_floors(tmp_path):
         ref,
         datetime(2026, 9, 17, 10, tzinfo=timezone.utc),
     ) == datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+
+
+def test_parse_ref_uses_configured_default_repo(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("default_repo: example/main\n", encoding="utf-8")
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+
+    assert github_ops.parse_ref("123").repo == "example/main"
+    assert github_ops.parse_ref("repo#123").repo == "example/repo"
+
+
+def test_search_discovery_uses_configured_mine_repos(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "mine_repos:\n  - example/one\n  - example/two\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        github_ops,
+        "gh_cli_json",
+        lambda args: calls.append(args) or [],
+    )
+
+    refs, warnings = github_ops.fetch_search_threads("2026-09-17")
+
+    assert refs == []
+    assert warnings == []
+    assert len(calls) == 10
+    assert {
+        args[args.index("--repo") + 1]
+        for args in calls
+    } == {"example/one", "example/two"}
+
+
+def test_sync_cutoff_uses_configured_bootstrap_and_overlap(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "sync:\n  bootstrap_days: 14\n  overlap_minutes: 2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CONFIG_ENV, str(config_file))
+    now = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    watermark = datetime(2026, 9, 17, 11, tzinfo=timezone.utc)
+
+    bootstrap_cutoff, bootstrap_mode = github_ops.resolve_sync_cutoff(now=now)
+    incremental_cutoff, incremental_mode = github_ops.resolve_sync_cutoff(
+        now=now,
+        last_successful_sync=watermark,
+    )
+
+    assert bootstrap_cutoff == now - timedelta(days=14)
+    assert bootstrap_mode == "incremental"
+    assert incremental_cutoff == watermark - timedelta(minutes=2)
+    assert incremental_mode == "incremental"
