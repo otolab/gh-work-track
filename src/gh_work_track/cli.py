@@ -127,9 +127,14 @@ def main(argv: list[str] | None = None) -> int:
                 if args.since is not None
                 else session.db.last_successful_sync()
             )
+            last_successful_started_at = (
+                None
+                if args.since is not None
+                else session.db.last_successful_sync_started_at()
+            )
             cutoff, mode = resolve_sync_cutoff(
                 since_days=args.since,
-                last_successful_sync=last_successful,
+                last_successful_sync=last_successful_started_at,
                 now=started,
             )
             metadata = sync_output_metadata(
@@ -143,9 +148,18 @@ def main(argv: list[str] | None = None) -> int:
                 cutoff_at=cutoff,
                 started_at=started,
             )
+            synced_threads = []
+            thread_state = {}
             try:
-                events, warnings, thread_count = collect_event_records(cutoff=cutoff)
+                events, warnings, thread_count = collect_event_records(
+                    cutoff=cutoff,
+                    optimize_threads=mode == "incremental",
+                    synced_threads=synced_threads,
+                )
                 new_count, total_count = save_events(events)
+                thread_state = session.capture_thread_state(synced_threads)
+                finished_at = datetime.now(timezone.utc)
+                session.mark_threads_synced(synced_threads, synced_at=finished_at)
                 payload = {
                     **metadata,
                     "cutoff_at": metadata["cutoff"],
@@ -179,21 +193,25 @@ def main(argv: list[str] | None = None) -> int:
                     new_count=new_count,
                     warnings=warnings,
                     error="",
-                    finished_at=datetime.now(timezone.utc),
+                    finished_at=finished_at,
                 )
                 if args.json:
                     print(json.dumps(payload, ensure_ascii=False, indent=2))
                 else:
                     print(markdown)
             except Exception as exc:
-                session.db.update_sync_run(
-                    run_id,
-                    status="failed",
-                    mode=mode,
-                    cutoff_at=cutoff,
-                    error=str(exc) or exc.__class__.__name__,
-                    finished_at=datetime.now(timezone.utc),
-                )
+                try:
+                    if thread_state:
+                        session.restore_thread_state(thread_state)
+                finally:
+                    session.db.update_sync_run(
+                        run_id,
+                        status="failed",
+                        mode=mode,
+                        cutoff_at=cutoff,
+                        error=str(exc) or exc.__class__.__name__,
+                        finished_at=datetime.now(timezone.utc),
+                    )
                 raise
             return 0
 
