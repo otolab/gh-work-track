@@ -10,6 +10,7 @@ dependencies = [
   "lancedb>=0.30.0",
   "pandas>=2.2.0",
   "pyarrow>=18.0.0",
+  "pyyaml>=6.0.0",
 ]
 
 [project.scripts]

@@ -136,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
                 since_days=args.since,
                 last_successful_sync=last_successful_started_at,
                 now=started,
+                bootstrap_days=getattr(args, "bootstrap_days", None),
+                overlap_minutes=getattr(args, "overlap_minutes", None),
             )
             metadata = sync_output_metadata(
                 mode=mode,
@@ -153,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 events, warnings, thread_count = collect_event_records(
                     cutoff=cutoff,
+                    mine_repos=getattr(args, "mine_repos", None),
                     optimize_threads=mode == "incremental",
                     synced_threads=synced_threads,
                 )

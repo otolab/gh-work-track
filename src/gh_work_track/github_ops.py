@@ -24,26 +24,32 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from gh_work_track.config import db_path as default_db_path
+from gh_work_track.config import (
+    DEFAULT_MINE_REPOS,
+    DEFAULT_REPO as CONFIG_DEFAULT_REPO,
+    DEFAULT_SYNC_BOOTSTRAP_DAYS,
+    DEFAULT_SYNC_OVERLAP_MINUTES,
+    db_path as default_db_path,
+    resolve_config,
+)
 from gh_work_track.session import get_session
 
-DEFAULT_REPO = "plaidev/karte-io-systems"
-SYNC_BOOTSTRAP_DAYS = 7
-SYNC_OVERLAP_MINUTES = 5
+# Kept as public aliases for callers that imported the old constants. Runtime
+# behavior resolves the config file and overrides through ``resolve_config``.
+DEFAULT_REPO = CONFIG_DEFAULT_REPO
+SYNC_BOOTSTRAP_DAYS = DEFAULT_SYNC_BOOTSTRAP_DAYS
+SYNC_OVERLAP_MINUTES = DEFAULT_SYNC_OVERLAP_MINUTES
 SYNC_SINCE_HELP = (
-    "バックフィル専用。省略時は前回成功 sync 以降の incremental（初回は 7 日 bootstrap）"
+    "バックフィル専用。省略時は前回成功 sync 以降の incremental（初回は設定された bootstrap 日数）"
 )
-MINE_REPOS = [
-    "plaidev/karte-io-systems",
-    "plaidev/karte-io-systems-ops",
-    "otolab/my-logs",
-]
+MINE_REPOS = list(DEFAULT_MINE_REPOS)
 
 REASON_JA = {
     "review_requested": "レビュー依頼",
@@ -146,8 +152,11 @@ def save_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
-def parse_ref(raw: str) -> ThreadRef:
+def parse_ref(raw: str, *, default_repo: str | None = None) -> ThreadRef:
     raw = raw.strip()
+    configured_default_repo = (
+        default_repo if default_repo is not None else resolve_config().default_repo
+    )
     if raw.startswith("notif:"):
         notif = gh_api(f"notifications/threads/{raw.split(':', 1)[1]}")
         return thread_ref_from_notification(notif)
@@ -163,13 +172,12 @@ def parse_ref(raw: str) -> ThreadRef:
     m = re.fullmatch(r"(?:([A-Za-z0-9_.-]+)/)?([A-Za-z0-9_.-]+)#(\d+)", raw)
     if m:
         owner, repo, num = m.group(1), m.group(2), int(m.group(3))
-        full_repo = f"{owner}/{repo}" if owner else f"plaidev/{repo}" if "/" not in repo else repo
-        if "/" not in full_repo:
-            full_repo = f"{DEFAULT_REPO.split('/')[0]}/{full_repo}"
+        default_owner = configured_default_repo.split("/", 1)[0]
+        full_repo = f"{owner}/{repo}" if owner else f"{default_owner}/{repo}"
         return ThreadRef(full_repo, num)
 
     if re.fullmatch(r"\d+", raw):
-        return ThreadRef(DEFAULT_REPO, int(raw))
+        return ThreadRef(configured_default_repo, int(raw))
 
     raise ValueError(f"cannot parse ref: {raw}")
 
@@ -227,12 +235,14 @@ def gh_cli_json(args: list[str]) -> Any:
     return json.loads(result.stdout or "null")
 
 
-def fetch_mine_open(repos: list[str] | None = None) -> list[ThreadSummary]:
+def fetch_mine_open(repos: Sequence[str] | None = None) -> list[ThreadSummary]:
     """自分の open PR/Issue。通知が来ていない作業の補完用。list API の結果をそのまま使い API 呼び出しを抑える。"""
-    repos = repos or MINE_REPOS
+    selected_repos = (
+        list(repos) if repos is not None else list(resolve_config().mine_repos)
+    )
     summaries: list[ThreadSummary] = []
     seen: set[str] = set()
-    for repo in repos:
+    for repo in selected_repos:
         for subcmd, kind in (("pr", "pr"), ("issue", "issue")):
             items = gh_cli_json([
                 subcmd, "list", "--repo", repo, "--author", "@me",
@@ -651,7 +661,8 @@ def resolve_sync_cutoff(
     since_days: int | None = None,
     last_successful_sync: datetime | None = None,
     now: datetime | None = None,
-    overlap_minutes: int = SYNC_OVERLAP_MINUTES,
+    bootstrap_days: int | None = None,
+    overlap_minutes: int | None = None,
 ) -> tuple[datetime, str]:
     """Resolve the effective cutoff and mode for a sync run.
 
@@ -660,8 +671,12 @@ def resolve_sync_cutoff(
     start boundary with a small overlap so events collected during that run
     can be re-read safely; the first run uses the bootstrap period instead.
     """
-    if overlap_minutes < 0:
-        raise ValueError("overlap_minutes は 0 以上で指定してください")
+    settings = resolve_config(
+        bootstrap_days=bootstrap_days,
+        overlap_minutes=overlap_minutes,
+    )
+    bootstrap_days = settings.sync.bootstrap_days
+    overlap_minutes = settings.sync.overlap_minutes
     current = normalize_datetime(now or datetime.now(timezone.utc))
     if since_days is not None:
         if since_days < 1:
@@ -670,7 +685,7 @@ def resolve_sync_cutoff(
     if last_successful_sync is not None:
         watermark = normalize_datetime(last_successful_sync)
         return watermark - timedelta(minutes=overlap_minutes), "incremental"
-    return current - timedelta(days=SYNC_BOOTSTRAP_DAYS), "incremental"
+    return current - timedelta(days=bootstrap_days), "incremental"
 
 
 def sync_output_metadata(
@@ -707,7 +722,10 @@ def search_thread_ref(item: dict[str, Any], kind_hint: str) -> ThreadRef | None:
     return ThreadRef(repo, int(item["number"]), "pr" if kind_hint == "pr" else "issue")
 
 
-def fetch_search_threads(since_date: str) -> tuple[list[ThreadRef], list[str]]:
+def fetch_search_threads(
+    since_date: str,
+    repos: Sequence[str] | None = None,
+) -> tuple[list[ThreadRef], list[str]]:
     """Find recently updated threads related to the authenticated user."""
     queries = [
         ("issues", "author"),
@@ -719,34 +737,40 @@ def fetch_search_threads(since_date: str) -> tuple[list[ThreadRef], list[str]]:
     refs: dict[str, ThreadRef] = {}
     warnings: list[str] = []
     fields = "number,repository,url,updatedAt"
-    for search_kind, qualifier in queries:
-        try:
-            items = gh_cli_json([
-                "search",
-                search_kind,
-                f"--{qualifier}",
-                "@me",
-                "--updated",
-                f">={since_date}",
-                "--sort",
-                "updated",
-                "--order",
-                "desc",
-                "--limit",
-                "100",
-                "--json",
-                fields,
-            ]) or []
-        except RuntimeError as exc:
-            raise SyncCollectionError(
-                f"gh search {search_kind} --{qualifier}: {exc}"
-            ) from exc
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            ref = search_thread_ref(item, "pr" if search_kind == "prs" else "issue")
-            if ref:
-                refs[ref.key] = ref
+    selected_repos = (
+        tuple(repos) if repos is not None else resolve_config().mine_repos
+    )
+    for repo in selected_repos:
+        for search_kind, qualifier in queries:
+            try:
+                items = gh_cli_json([
+                    "search",
+                    search_kind,
+                    f"--{qualifier}",
+                    "@me",
+                    "--repo",
+                    repo,
+                    "--updated",
+                    f">={since_date}",
+                    "--sort",
+                    "updated",
+                    "--order",
+                    "desc",
+                    "--limit",
+                    "100",
+                    "--json",
+                    fields,
+                ]) or []
+            except RuntimeError as exc:
+                raise SyncCollectionError(
+                    f"gh search {search_kind} --{qualifier} --repo {repo}: {exc}"
+                ) from exc
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                ref = search_thread_ref(item, "pr" if search_kind == "prs" else "issue")
+                if ref:
+                    refs[ref.key] = ref
     return list(refs.values()), warnings
 
 
@@ -793,7 +817,9 @@ def collect_event_records(
     *,
     cutoff: datetime | None = None,
     since_days: int | None = None,
-    overlap_minutes: int = SYNC_OVERLAP_MINUTES,
+    bootstrap_days: int | None = None,
+    overlap_minutes: int | None = None,
+    mine_repos: Sequence[str] | None = None,
     optimize_threads: bool | None = None,
     synced_threads: list[ThreadSyncBoundary] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
@@ -815,12 +841,14 @@ def collect_event_records(
         cutoff, _ = resolve_sync_cutoff(
             since_days=since_days,
             now=datetime.now(timezone.utc),
+            bootstrap_days=bootstrap_days,
             overlap_minutes=overlap_minutes,
         )
     elif cutoff is None:
         cutoff, _ = resolve_sync_cutoff(
             last_successful_sync=get_session().db.last_successful_sync_started_at(),
             now=datetime.now(timezone.utc),
+            bootstrap_days=bootstrap_days,
             overlap_minutes=overlap_minutes,
         )
     else:
@@ -845,7 +873,13 @@ def collect_event_records(
         refs[ref.key] = ref
         notifications_by_ref.setdefault(ref.key, []).append(notification)
 
-    search_refs, search_warnings = fetch_search_threads(cutoff.date().isoformat())
+    if mine_repos is None:
+        search_refs, search_warnings = fetch_search_threads(cutoff.date().isoformat())
+    else:
+        search_refs, search_warnings = fetch_search_threads(
+            cutoff.date().isoformat(),
+            repos=mine_repos,
+        )
     warnings.extend(search_warnings)
     for ref in search_refs:
         refs[ref.key] = ref
@@ -993,6 +1027,7 @@ def collect_threads(
     unread_only: bool = False,
     include_watch: bool = True,
     include_mine: bool = True,
+    mine_repos: Sequence[str] | None = None,
 ) -> list[ThreadSummary]:
     since = since_days_iso(since_days)
     watch_map = {f"{t['repo']}#{t['number']}": t.get("note", "") for t in load_watch()}
@@ -1039,7 +1074,12 @@ def collect_threads(
             merge_summary(summaries, s)
 
     if include_mine:
-        for s in fetch_mine_open():
+        mine_items = (
+            fetch_mine_open()
+            if mine_repos is None
+            else fetch_mine_open(mine_repos)
+        )
+        for s in mine_items:
             key = s.ref.key
             if key in watch_map:
                 s.is_watched = True
@@ -1125,6 +1165,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         unread_only=args.unread_only,
         include_watch=include_watch,
         include_mine=include_mine,
+        mine_repos=getattr(args, "mine_repos", None),
     )
     meta = list_meta_line(args)
     if args.json:
@@ -1165,6 +1206,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
         since_days=args.since,
         last_successful_sync=last_successful_started_at,
         now=now,
+        bootstrap_days=getattr(args, "bootstrap_days", None),
+        overlap_minutes=getattr(args, "overlap_minutes", None),
     )
     metadata = sync_output_metadata(
         mode=mode,
@@ -1174,6 +1217,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
     synced_threads: list[ThreadSyncBoundary] = []
     events, warnings, thread_count = collect_event_records(
         cutoff=cutoff,
+        mine_repos=getattr(args, "mine_repos", None),
         optimize_threads=mode == "incremental",
         synced_threads=synced_threads,
     )
@@ -1314,7 +1358,7 @@ def format_drill_markdown(ref: ThreadRef, issue: dict[str, Any], comments: list[
 
 
 def cmd_drill(args: argparse.Namespace) -> int:
-    ref = parse_ref(args.ref)
+    ref = parse_ref(args.ref, default_repo=getattr(args, "default_repo", None))
     if ref.number == 0:
         print("drill requires a resolvable issue/PR ref", file=sys.stderr)
         return 1
@@ -1351,7 +1395,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return 0
 
     for raw in args.refs:
-        ref = parse_ref(raw)
+        ref = parse_ref(raw, default_repo=getattr(args, "default_repo", None))
         key = ref.key
         if args.action == "add":
             existing[key] = {
@@ -1369,10 +1413,43 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 
 def cmd_mark_seen(args: argparse.Namespace) -> int:
-    ref = parse_ref(args.ref)
+    ref = parse_ref(args.ref, default_repo=getattr(args, "default_repo", None))
     mark_seen(ref)
     print(f"marked seen: {ref.key}")
     return 0
+
+
+def add_config_options(
+    parser: argparse.ArgumentParser,
+    *,
+    suppress_defaults: bool = False,
+) -> None:
+    """Add configuration overrides to a root or command parser."""
+    default = argparse.SUPPRESS if suppress_defaults else None
+    parser.add_argument(
+        "--default-repo",
+        default=default,
+        help="数字だけの ref に使う owner/repo（env/config より優先）",
+    )
+    parser.add_argument(
+        "--mine-repo",
+        dest="mine_repos",
+        action="append",
+        default=default,
+        help="search discovery 対象 repo（複数回指定可）",
+    )
+    parser.add_argument(
+        "--bootstrap-days",
+        type=int,
+        default=default,
+        help="初回 incremental sync の遡り日数（default: 7）",
+    )
+    parser.add_argument(
+        "--overlap-minutes",
+        type=int,
+        default=default,
+        help="incremental sync の overlap 分数（default: 5）",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1381,9 +1458,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--db",
         help="LanceDB ディレクトリ（default: ~/.local/share/gh-work-track/lance）",
     )
+    add_config_options(p)
     sub = p.add_subparsers(dest="command", required=True)
 
     lp = sub.add_parser("list", help="作業スレッド一覧（複数ソース統合）")
+    add_config_options(lp, suppress_defaults=True)
     lp.add_argument("--since", type=int, default=7, help="通知の遡り日数 (default: 7)。watch/mine は期間外も含む")
     lp.add_argument("--unread-only", action="store_true", help="通知は未読のみ（GitHub デフォルト相当）")
     lp.add_argument("--notifications-only", action="store_true", help="通知のみ（watch/mine なし）")
@@ -1394,11 +1473,13 @@ def build_parser() -> argparse.ArgumentParser:
     lp.set_defaults(func=cmd_list)
 
     cp = sub.add_parser("collect", help="自分に関するイベントを取得して保存（sync の別名）")
+    add_config_options(cp, suppress_defaults=True)
     cp.add_argument("--since", type=int, help=SYNC_SINCE_HELP)
     cp.add_argument("--json", action="store_true")
     cp.set_defaults(func=cmd_collect)
 
     sp = sub.add_parser("sync", help="GitHub からイベントを同期")
+    add_config_options(sp, suppress_defaults=True)
     sp.add_argument("--since", type=int, help=SYNC_SINCE_HELP)
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_collect)
@@ -1411,6 +1492,7 @@ def build_parser() -> argparse.ArgumentParser:
     dap.set_defaults(func=cmd_daily)
 
     dp = sub.add_parser("drill", help="スレッドの深堀り")
+    add_config_options(dp, suppress_defaults=True)
     dp.add_argument("ref", help="plaidev/karte-io-systems#123 / notif:ID / URL")
     dp.add_argument("--comments", type=int, default=10)
     dp.add_argument("--no-mark-seen", action="store_true")
@@ -1418,6 +1500,7 @@ def build_parser() -> argparse.ArgumentParser:
     dp.set_defaults(func=cmd_drill)
 
     wp = sub.add_parser("watch", help="watch リスト管理")
+    add_config_options(wp, suppress_defaults=True)
     wp.add_argument("action", choices=["list", "add", "remove"])
     wp.add_argument("refs", nargs="*")
     wp.add_argument("--note", default="")
@@ -1425,6 +1508,7 @@ def build_parser() -> argparse.ArgumentParser:
     wp.set_defaults(func=cmd_watch)
 
     mp = sub.add_parser("mark-seen", help="最終確認済みを更新")
+    add_config_options(mp, suppress_defaults=True)
     mp.add_argument("ref")
     mp.set_defaults(func=cmd_mark_seen)
 

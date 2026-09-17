@@ -42,6 +42,36 @@ def test_sync_records_success(monkeypatch, tmp_path):
     assert rows.iloc[0]["event_count"] == 1
 
 
+def test_sync_passes_cli_configuration_overrides(monkeypatch, tmp_path):
+    db_path = tmp_path / "lance"
+    cutoff_args = {}
+    collect_args = {}
+
+    def fake_resolve_sync_cutoff(**kwargs):
+        cutoff_args.update(kwargs)
+        return datetime(2026, 9, 17, 10, tzinfo=timezone.utc), "incremental"
+
+    monkeypatch.setattr(cli, "resolve_sync_cutoff", fake_resolve_sync_cutoff)
+    monkeypatch.setattr(
+        cli,
+        "collect_event_records",
+        lambda **kwargs: collect_args.update(kwargs) or ([], [], 0),
+    )
+    monkeypatch.setattr(cli, "save_events", lambda events: (0, 0))
+
+    assert cli.main([
+        "--db", str(db_path),
+        "sync",
+        "--mine-repo", "cli/repo",
+        "--bootstrap-days", "11",
+        "--overlap-minutes", "1",
+    ]) == 0
+
+    assert cutoff_args["bootstrap_days"] == 11
+    assert cutoff_args["overlap_minutes"] == 1
+    assert collect_args["mine_repos"] == ["cli/repo"]
+
+
 def test_sync_help_explains_incremental_and_backfill_modes(capsys):
     for command in ("sync", "collect"):
         with pytest.raises(SystemExit) as exc_info:
