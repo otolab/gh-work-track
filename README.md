@@ -60,20 +60,11 @@ sync:
 
 値の優先順位は **フラグ > env > config > default** です。`sync --since N` は設定された bootstrap 日数ではなく、明示的な N 日の backfill として動作します。
 
-### sync の discovery とレート制限
+### sync の discovery
 
-`sync` は `gh search` のグローバル検索を主経路として、次の条件を直近の更新日時に適用します。
+`sync` は notifications / watch に加え、**global `gh search` を主経路**として ThreadRef を列挙します（Issue: `author` / `assignee` / `commenter`、PR: `author` / `assignee` / `reviewed-by` / `commenter`）。`search_orgs` で org 絞り込み、`mine_repos` で追加の per-repo search を union します。取りこぼし補完に Events API（最新 ~300 イベント窓）も使います。
 
-- Issue: `author` / `assignee` / `commenter`
-- Pull request: `author` / `assignee` / `reviewed-by` / `commenter`
-
-`search_orgs` を設定すると organization ごとに検索し、設定しない場合は全 organization が対象です。グローバル検索の結果に加えて、`mine_repos` に設定した repo も従来型の per-repo 検索で確認し、重複を統合します。
-
-検索の取りこぼしを補完するため、認証ユーザーの Events API（`users/{username}/events`）からも Issue、PR、コメント、レビューなどのイベントを抽出して結果に統合します。この API にはサーバー側の日付フィルタがないため、cutoff より前のイベントはクライアント側で除外します。取得できるのは直近約 300 イベントまでで、高活動量のアカウントでは古い活動が欠落する可能性があります。Events API の失敗は warning として扱い、search と notifications の結果で sync を継続します。
-
-追加 repo 用に `extra_repos` は導入しません。既存の `mine_repos` を追加経路として利用できます。
-
-検索結果は 1 クエリあたり GitHub の上限 1,000 件までです。各 qualifier の取得件数を sync の warning に出力し、900 件以上の場合は結果が切り捨てられる可能性を警告します。backfill（`sync --since N`）の検索は直列に実行し、呼び出し間隔を空けます。検索が 429/403 になった場合は Retry-After を使って上限回数まで再試行し、解消しなければ sync を失敗させます。失敗した sync は watermark を進めません。
+GitHub API の制限（search 1,000 件/qualifier、Events 300 件窓、429 リトライ、失敗時 watermark など）と設計判断の詳細は **[docs/github-api-design.md](docs/github-api-design.md)** を参照。パイプライン全体は **[docs/architecture.md](docs/architecture.md)**。
 
 ## 使い方
 
@@ -114,6 +105,13 @@ uv run gh-work-track list --since 7
 uv run gh-work-track drill 170102
 uv run gh-work-track watch list
 ```
+
+## ドキュメント
+
+| 文書 | 内容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | sync パイプライン（discovery → collection → LanceDB） |
+| [docs/github-api-design.md](docs/github-api-design.md) | GitHub API 制限と対応方針 |
 
 ## LanceDB 設計（search-docs 踏襲）
 
