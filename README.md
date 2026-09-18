@@ -9,7 +9,7 @@
 | 機能 | 状態 |
 |---|---|
 | LanceDB スキーマ / `init` / `stats` / `daily` | ✅ |
-| `sync` / `collect`（notifications + watch + search → events） | ✅ |
+| `sync` / `collect`（notifications + watch + search + Events API → events） | ✅ |
 | `watch` / `list` / `drill` / `mark-seen` | ✅ |
 | `migrate`（my-logs プロトタイプ JSONL → LanceDB） | ✅ |
 | modular-prompt-extract 連携 | 🔜 別途 |
@@ -68,6 +68,8 @@ sync:
 - Pull request: `author` / `assignee` / `reviewed-by` / `commenter`
 
 `search_orgs` を設定すると organization ごとに検索し、設定しない場合は全 organization が対象です。グローバル検索の結果に加えて、`mine_repos` に設定した repo も従来型の per-repo 検索で確認し、重複を統合します。
+
+検索の取りこぼしを補完するため、認証ユーザーの Events API（`users/{username}/events`）からも Issue、PR、コメント、レビューなどのイベントを抽出して結果に統合します。この API にはサーバー側の日付フィルタがないため、cutoff より前のイベントはクライアント側で除外します。取得できるのは直近約 300 イベントまでで、高活動量のアカウントでは古い活動が欠落する可能性があります。Events API の失敗は warning として扱い、search と notifications の結果で sync を継続します。
 
 追加 repo 用に `extra_repos` は導入しません。既存の `mine_repos` を追加経路として利用できます。
 

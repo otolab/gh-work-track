@@ -117,6 +117,97 @@ def test_fetch_timeline_does_not_stop_when_page_has_unknown_timestamp(monkeypatc
     assert [path.rsplit("page=", 1)[1] for path in calls] == ["1", "2", "3", "4"]
 
 
+def test_fetch_user_event_threads_unions_repositories_and_applies_cutoff(monkeypatch):
+    cutoff = datetime(2026, 9, 17, 10, tzinfo=timezone.utc)
+    event_records = [
+        {
+            "type": "PullRequestEvent",
+            "created_at": "2026-09-17T11:00:00Z",
+            "repo": {"name": "otolab/repo-a"},
+            "payload": {"number": 1},
+        },
+        {
+            "type": "IssuesEvent",
+            "created_at": "2026-09-17T12:00:00Z",
+            "repo": {"name": "otolab/repo-b"},
+            "payload": {"issue": {"number": 2}},
+        },
+        {
+            "type": "IssueCommentEvent",
+            "created_at": "2026-09-17T13:00:00Z",
+            "repo": {"name": "otolab/repo-c"},
+            "payload": {
+                "issue": {
+                    "number": 3,
+                    "pull_request": {"url": "https://api.github.com/repos/otolab/repo-c/pulls/3"},
+                }
+            },
+        },
+        {
+            "type": "PullRequestReviewEvent",
+            "created_at": "2026-09-17T14:00:00Z",
+            "repo": {"name": "otolab/repo-a"},
+            "payload": {"pull_request": {"number": 1}},
+        },
+        {
+            "type": "IssuesEvent",
+            "created_at": "2026-09-17T09:00:00Z",
+            "repo": {"name": "otolab/repo-old"},
+            "payload": {"issue": {"number": 4}},
+        },
+    ]
+    calls: list[tuple[str, bool]] = []
+
+    def fake_gh_api(path: str, *, paginate: bool = False):
+        calls.append((path, paginate))
+        if path == "user":
+            return {"login": "alice"}
+        assert path == "users/alice/events?per_page=100"
+        assert paginate is True
+        return event_records
+
+    monkeypatch.setattr(github_ops, "gh_api", fake_gh_api)
+
+    refs, warnings = github_ops.fetch_user_event_threads(cutoff)
+
+    assert {ref.key for ref in refs} == {
+        "otolab/repo-a#1",
+        "otolab/repo-b#2",
+        "otolab/repo-c#3",
+    }
+    assert {ref.key: ref.kind for ref in refs} == {
+        "otolab/repo-a#1": "pr",
+        "otolab/repo-b#2": "issue",
+        "otolab/repo-c#3": "pr",
+    }
+    assert warnings == []
+    assert calls == [("user", False), ("users/alice/events?per_page=100", True)]
+
+
+def test_fetch_user_event_threads_warns_when_event_window_is_old_or_full(monkeypatch):
+    cutoff = datetime(2026, 9, 17, 10, tzinfo=timezone.utc)
+    event_records = [
+        {
+            "type": "IssuesEvent",
+            "created_at": "2026-09-17T09:00:00Z",
+            "repo": {"name": "otolab/repo"},
+            "payload": {"issue": {"number": index + 1}},
+        }
+        for index in range(github_ops.EVENTS_RESULT_WARNING_THRESHOLD)
+    ]
+
+    def fake_gh_api(path: str, *, paginate: bool = False):
+        return {"login": "alice"} if path == "user" else event_records
+
+    monkeypatch.setattr(github_ops, "gh_api", fake_gh_api)
+
+    refs, warnings = github_ops.fetch_user_event_threads(cutoff)
+
+    assert refs == []
+    assert any("~300-event limit" in warning for warning in warnings)
+    assert any("before cutoff" in warning for warning in warnings)
+
+
 def test_unknown_commented_activity_keeps_comments_fallback(monkeypatch, tmp_path):
     ref = github_ops.ThreadRef("otolab/my-logs", 2049)
     session = open_session(str(tmp_path / "lance"))
@@ -125,6 +216,7 @@ def test_unknown_commented_activity_keeps_comments_fallback(monkeypatch, tmp_pat
     comments_calls = 0
 
     monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
@@ -175,6 +267,7 @@ def test_thread_start_boundary_keeps_events_created_during_collection(
     fetch_calls = 0
 
     monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
     monkeypatch.setattr(
         github_ops,
         "fetch_search_threads",
@@ -215,6 +308,48 @@ def test_thread_start_boundary_keeps_events_created_during_collection(
 
     assert fetch_calls == 2
     assert [event["timestamp"] for event in second_events] == [late_events[0]["created_at"]]
+
+
+def test_collect_event_records_unions_events_and_deduplicates_search_refs(
+    monkeypatch, tmp_path
+):
+    search_ref = github_ops.ThreadRef("otolab/shared", 42, "issue")
+    event_only_ref = github_ops.ThreadRef("otolab/events", 7, "pr")
+    timeline_refs: list[github_ops.ThreadRef] = []
+    open_session(str(tmp_path / "lance"))
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([search_ref], []),
+    )
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_user_event_threads",
+        lambda cutoff: (
+            [github_ops.ThreadRef(search_ref.repo, search_ref.number, "pr"), event_only_ref],
+            ["events: fixture warning"],
+        ),
+    )
+
+    def fetch_timeline(ref, *args, **kwargs):
+        timeline_refs.append(ref)
+        return []
+
+    monkeypatch.setattr(github_ops, "fetch_timeline", fetch_timeline)
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+
+    events, warnings, thread_count = github_ops.collect_event_records(
+        cutoff=datetime(2026, 9, 17, 10, tzinfo=timezone.utc)
+    )
+
+    assert [ref.key for ref in timeline_refs] == [search_ref.key, event_only_ref.key]
+    assert timeline_refs[0].kind == "issue"
+    assert events == []
+    assert warnings == ["events: fixture warning"]
+    assert thread_count == 2
 
 
 def test_effective_thread_cutoff_uses_global_thread_and_db_floors(tmp_path):

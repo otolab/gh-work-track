@@ -10,6 +10,11 @@ from gh_work_track.db import WorkTrackDB
 from gh_work_track.session import Session
 
 
+@pytest.fixture(autouse=True)
+def disable_user_event_discovery(monkeypatch):
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+
+
 def sync_runs(db_path):
     db = WorkTrackDB(str(db_path))
     db.init_tables()
@@ -200,6 +205,34 @@ def test_partial_collection_failure_does_not_advance_watermark(
     failed = rows[rows["status"] == "failed"].iloc[0]
     assert error_fragment in failed["error"]
     assert WorkTrackDB(str(db_path)).last_successful_sync() == last_successful
+
+
+def test_events_failure_is_warning_only_and_advances_watermark(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    ref = github_ops.ThreadRef("otolab/events", 7, "issue")
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([ref], []),
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_user_event_threads",
+        raise_runtime_error("events unavailable"),
+    )
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+    monkeypatch.setattr(github_ops, "fetch_timeline", lambda *args, **kwargs: [])
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref_arg: [])
+
+    assert cli.main(["--db", str(db_path), "sync", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["warnings"] == ["events: events unavailable"]
+    assert WorkTrackDB(str(db_path)).last_successful_sync() is not None
+    assert sync_runs(db_path)["status"].tolist() == ["success"]
 
 
 def _comment(comment_id: int, timestamp: datetime, body: str) -> dict:

@@ -60,6 +60,8 @@ SEARCH_INTERVAL_SECONDS = 2.0
 SEARCH_MAX_RETRIES = 3
 SEARCH_RETRY_BACKOFF_SECONDS = 1.0
 SEARCH_MAX_RETRY_WAIT_SECONDS = 300.0
+EVENTS_RESULT_LIMIT = 300
+EVENTS_RESULT_WARNING_THRESHOLD = 270
 
 REASON_JA = {
     "review_requested": "レビュー依頼",
@@ -661,6 +663,133 @@ def since_iso(cutoff: datetime) -> str:
     return normalize_datetime(cutoff).isoformat().replace("+00:00", "Z")
 
 
+def _event_repo_name(event: dict[str, Any]) -> str:
+    repository = event.get("repo")
+    if isinstance(repository, str):
+        return repository
+    if isinstance(repository, dict):
+        for field_name in ("name", "full_name", "nameWithOwner"):
+            value = repository.get(field_name)
+            if value:
+                return str(value)
+
+    repository = event.get("repository")
+    if isinstance(repository, dict):
+        for field_name in ("full_name", "nameWithOwner", "name"):
+            value = repository.get(field_name)
+            if value:
+                return str(value)
+    return ""
+
+
+def _event_number(payload: dict[str, Any], field_name: str) -> int | None:
+    value = payload.get(field_name)
+    if isinstance(value, dict):
+        value = value.get("number")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def event_thread_ref(event: dict[str, Any]) -> ThreadRef | None:
+    """Extract a thread reference from a user event when it represents one."""
+    event_type = str(event.get("type", ""))
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    issue = payload.get("issue")
+    pull_request = payload.get("pull_request")
+    if event_type in {
+        "PullRequestEvent",
+        "PullRequestReviewEvent",
+        "PullRequestReviewCommentEvent",
+        "PullRequestReviewThreadEvent",
+    }:
+        kind = "pr"
+        number = _event_number(payload, "number")
+        if number is None and isinstance(pull_request, dict):
+            number = _event_number(pull_request, "number")
+    elif event_type in {"IssuesEvent", "IssueCommentEvent"}:
+        kind = "pr" if isinstance(issue, dict) and "pull_request" in issue else "issue"
+        number = _event_number(payload, "number")
+        if number is None and isinstance(issue, dict):
+            number = _event_number(issue, "number")
+    else:
+        return None
+
+    repo = _event_repo_name(event)
+    if not repo or number is None:
+        return None
+    return ThreadRef(repo, number, kind)
+
+
+def _event_cutoff(value: datetime | str) -> datetime:
+    if isinstance(value, datetime):
+        return normalize_datetime(value)
+    parsed = parse_timestamp(value)
+    if parsed is not None:
+        return parsed
+    try:
+        return normalize_datetime(datetime.fromisoformat(value))
+    except ValueError as exc:
+        raise ValueError(f"invalid events cutoff: {value}") from exc
+
+
+def fetch_user_event_threads(
+    cutoff: datetime | str,
+) -> tuple[list[ThreadRef], list[str]]:
+    """Find threads from the authenticated user's recent Events API activity.
+
+    GitHub does not provide a date filter for this endpoint, so events before
+    ``cutoff`` are discarded locally.  The endpoint is a complement to search,
+    not a complete activity history.
+    """
+    user = gh_api("user")
+    if not isinstance(user, dict) or not user.get("login"):
+        raise RuntimeError("authenticated user response has no login")
+    username = str(user["login"])
+
+    raw_events = gh_api(f"users/{username}/events?per_page=100", paginate=True)
+    if raw_events is None:
+        raw_events = []
+    if not isinstance(raw_events, list):
+        raise RuntimeError("expected a JSON array from user events")
+
+    effective_cutoff = _event_cutoff(cutoff)
+    refs: dict[str, ThreadRef] = {}
+    warnings: list[str] = []
+    old_event_count = 0
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+        timestamp = parse_timestamp(str(event.get("created_at", "")))
+        if timestamp is not None and timestamp < effective_cutoff:
+            old_event_count += 1
+            continue
+        if timestamp is None:
+            continue
+        ref = event_thread_ref(event)
+        if ref is not None:
+            refs.setdefault(ref.key, ref)
+
+    event_count = len(raw_events)
+    if event_count >= EVENTS_RESULT_WARNING_THRESHOLD:
+        warnings.append(
+            f"events: {event_count} events returned (near the ~{EVENTS_RESULT_LIMIT}-event limit; "
+            "older activity may be missing)"
+        )
+    if old_event_count and old_event_count >= event_count / 2:
+        warnings.append(
+            f"events: filtered {old_event_count}/{event_count} events before cutoff; "
+            "the endpoint has no server-side date filter"
+        )
+
+    return list(refs.values()), warnings
+
+
 def since_days_iso(since_days: int) -> str:
     """Format the legacy day-based period used by the list command."""
     return since_iso(datetime.now(timezone.utc) - timedelta(days=since_days))
@@ -1088,6 +1217,15 @@ def collect_event_records(
         if kind not in ("issue", "pr"):
             kind = "issue"
         refs.setdefault(f"{repo}#{number}", ThreadRef(repo, number, kind))
+
+    try:
+        event_refs, event_warnings = fetch_user_event_threads(cutoff)
+    except Exception as exc:
+        warnings.append(f"events: {exc}" if str(exc) else f"events: {exc.__class__.__name__}")
+    else:
+        warnings.extend(event_warnings)
+        for ref in event_refs:
+            refs.setdefault(ref.key, ref)
 
     events: list[dict[str, Any]] = []
     for notification in fallback_notifications:
