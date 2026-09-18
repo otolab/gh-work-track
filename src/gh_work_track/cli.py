@@ -156,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
                 events, warnings, thread_count = collect_event_records(
                     cutoff=cutoff,
                     mine_repos=getattr(args, "mine_repos", None),
+                    search_orgs=getattr(args, "search_orgs", None),
+                    backfill=mode == "backfill",
                     optimize_threads=mode == "incremental",
                     synced_threads=synced_threads,
                 )

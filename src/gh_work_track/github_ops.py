@@ -24,6 +24,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -50,6 +51,17 @@ SYNC_SINCE_HELP = (
     "バックフィル専用。省略時は前回成功 sync 以降の incremental（初回は設定された bootstrap 日数）"
 )
 MINE_REPOS = list(DEFAULT_MINE_REPOS)
+
+# GitHub search returns at most 1,000 results for one query.  Ask gh for the
+# largest useful page so a high result count can be surfaced to the caller.
+SEARCH_RESULT_LIMIT = 1000
+SEARCH_RESULT_WARNING_THRESHOLD = 900
+SEARCH_INTERVAL_SECONDS = 2.0
+SEARCH_MAX_RETRIES = 3
+SEARCH_RETRY_BACKOFF_SECONDS = 1.0
+SEARCH_MAX_RETRY_WAIT_SECONDS = 300.0
+EVENTS_RESULT_LIMIT = 300
+EVENTS_RESULT_WARNING_THRESHOLD = 270
 
 REASON_JA = {
     "review_requested": "レビュー依頼",
@@ -651,6 +663,133 @@ def since_iso(cutoff: datetime) -> str:
     return normalize_datetime(cutoff).isoformat().replace("+00:00", "Z")
 
 
+def _event_repo_name(event: dict[str, Any]) -> str:
+    repository = event.get("repo")
+    if isinstance(repository, str):
+        return repository
+    if isinstance(repository, dict):
+        for field_name in ("name", "full_name", "nameWithOwner"):
+            value = repository.get(field_name)
+            if value:
+                return str(value)
+
+    repository = event.get("repository")
+    if isinstance(repository, dict):
+        for field_name in ("full_name", "nameWithOwner", "name"):
+            value = repository.get(field_name)
+            if value:
+                return str(value)
+    return ""
+
+
+def _event_number(payload: dict[str, Any], field_name: str) -> int | None:
+    value = payload.get(field_name)
+    if isinstance(value, dict):
+        value = value.get("number")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def event_thread_ref(event: dict[str, Any]) -> ThreadRef | None:
+    """Extract a thread reference from a user event when it represents one."""
+    event_type = str(event.get("type", ""))
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    issue = payload.get("issue")
+    pull_request = payload.get("pull_request")
+    if event_type in {
+        "PullRequestEvent",
+        "PullRequestReviewEvent",
+        "PullRequestReviewCommentEvent",
+        "PullRequestReviewThreadEvent",
+    }:
+        kind = "pr"
+        number = _event_number(payload, "number")
+        if number is None and isinstance(pull_request, dict):
+            number = _event_number(pull_request, "number")
+    elif event_type in {"IssuesEvent", "IssueCommentEvent"}:
+        kind = "pr" if isinstance(issue, dict) and "pull_request" in issue else "issue"
+        number = _event_number(payload, "number")
+        if number is None and isinstance(issue, dict):
+            number = _event_number(issue, "number")
+    else:
+        return None
+
+    repo = _event_repo_name(event)
+    if not repo or number is None:
+        return None
+    return ThreadRef(repo, number, kind)
+
+
+def _event_cutoff(value: datetime | str) -> datetime:
+    if isinstance(value, datetime):
+        return normalize_datetime(value)
+    parsed = parse_timestamp(value)
+    if parsed is not None:
+        return parsed
+    try:
+        return normalize_datetime(datetime.fromisoformat(value))
+    except ValueError as exc:
+        raise ValueError(f"invalid events cutoff: {value}") from exc
+
+
+def fetch_user_event_threads(
+    cutoff: datetime | str,
+) -> tuple[list[ThreadRef], list[str]]:
+    """Find threads from the authenticated user's recent Events API activity.
+
+    GitHub does not provide a date filter for this endpoint, so events before
+    ``cutoff`` are discarded locally.  The endpoint is a complement to search,
+    not a complete activity history.
+    """
+    user = gh_api("user")
+    if not isinstance(user, dict) or not user.get("login"):
+        raise RuntimeError("authenticated user response has no login")
+    username = str(user["login"])
+
+    raw_events = gh_api(f"users/{username}/events?per_page=100", paginate=True)
+    if raw_events is None:
+        raw_events = []
+    if not isinstance(raw_events, list):
+        raise RuntimeError("expected a JSON array from user events")
+
+    effective_cutoff = _event_cutoff(cutoff)
+    refs: dict[str, ThreadRef] = {}
+    warnings: list[str] = []
+    old_event_count = 0
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+        timestamp = parse_timestamp(str(event.get("created_at", "")))
+        if timestamp is not None and timestamp < effective_cutoff:
+            old_event_count += 1
+            continue
+        if timestamp is None:
+            continue
+        ref = event_thread_ref(event)
+        if ref is not None:
+            refs.setdefault(ref.key, ref)
+
+    event_count = len(raw_events)
+    if event_count >= EVENTS_RESULT_WARNING_THRESHOLD:
+        warnings.append(
+            f"events: {event_count} events returned (near the ~{EVENTS_RESULT_LIMIT}-event limit; "
+            "older activity may be missing)"
+        )
+    if old_event_count and old_event_count >= event_count / 2:
+        warnings.append(
+            f"events: filtered {old_event_count}/{event_count} events before cutoff; "
+            "the endpoint has no server-side date filter"
+        )
+
+    return list(refs.values()), warnings
+
+
 def since_days_iso(since_days: int) -> str:
     """Format the legacy day-based period used by the list command."""
     return since_iso(datetime.now(timezone.utc) - timedelta(days=since_days))
@@ -722,53 +861,227 @@ def search_thread_ref(item: dict[str, Any], kind_hint: str) -> ThreadRef | None:
     return ThreadRef(repo, int(item["number"]), "pr" if kind_hint == "pr" else "issue")
 
 
+class _SearchRateLimiter:
+    """Keep backfill search requests serial and separated by a fixed interval."""
+
+    def __init__(self, *, interval_seconds: float) -> None:
+        self.interval_seconds = max(0.0, interval_seconds)
+        self.last_started_at: float | None = None
+
+    def before_call(self) -> None:
+        now = time.monotonic()
+        if self.last_started_at is not None:
+            remaining = self.interval_seconds - (now - self.last_started_at)
+            if remaining > 0:
+                time.sleep(remaining)
+        self.last_started_at = time.monotonic()
+
+
+def _is_search_rate_limit_error(exc: RuntimeError) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (403, 429, "403", "429"):
+        return True
+    if getattr(exc, "retry_after", None) is not None:
+        return True
+    message = str(exc)
+    return bool(
+        re.search(r"\b(?:403|429)\b", message)
+        or re.search(r"rate[- ]limit|secondary rate", message, re.IGNORECASE)
+    )
+
+
+def _retry_after_seconds(exc: RuntimeError, attempt: int) -> float:
+    """Return a bounded retry delay from an error, or exponential backoff."""
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is None:
+        message = str(exc)
+        match = re.search(
+            r"retry[- ]after\s*(?:header\s*)?(?:[:=]\s*|\s+)(\d+(?:\.\d+)?)",
+            message,
+            re.IGNORECASE,
+        )
+        if match:
+            retry_after = match.group(1)
+
+    try:
+        delay = float(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        delay = None
+    if delay is None:
+        reset_match = re.search(
+            r"x[- ]?ratelimit[- ]?reset\s*[:=]\s*(\d+)",
+            str(exc),
+            re.IGNORECASE,
+        )
+        if reset_match:
+            delay = max(0.0, float(reset_match.group(1)) - time.time())
+    if delay is None:
+        delay = SEARCH_RETRY_BACKOFF_SECONDS * (2**attempt)
+    return min(max(0.0, delay), SEARCH_MAX_RETRY_WAIT_SECONDS)
+
+
+def _search_label(
+    search_kind: str,
+    qualifier: str,
+    *,
+    repo: str | None = None,
+    org: str | None = None,
+) -> str:
+    if repo:
+        scope = f"repo:{repo}"
+    elif org:
+        scope = f"org:{org}"
+    else:
+        scope = "global"
+    return f"gh search {search_kind} --{qualifier} ({scope})"
+
+
+def _search_args(
+    search_kind: str,
+    qualifier: str,
+    since_date: str,
+    *,
+    repo: str | None = None,
+    org: str | None = None,
+) -> list[str]:
+    args = ["search", search_kind]
+    if org:
+        # gh search exposes GitHub's global search syntax as positional query
+        # terms.  ``--org`` is not available consistently across gh versions.
+        args.append(f"org:{org}")
+    args.extend([
+        f"--{qualifier}",
+        "@me",
+    ])
+    if repo:
+        args.extend(["--repo", repo])
+    args.extend([
+        "--updated",
+        f">={since_date}",
+        "--sort",
+        "updated",
+        "--order",
+        "desc",
+        "--limit",
+        str(SEARCH_RESULT_LIMIT),
+        "--json",
+        "number,repository,url,updatedAt",
+    ])
+    return args
+
+
+def _run_search_query(
+    args: list[str],
+    label: str,
+    *,
+    limiter: _SearchRateLimiter,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    for attempt in range(SEARCH_MAX_RETRIES + 1):
+        limiter.before_call()
+        try:
+            result = gh_cli_json(args)
+        except RuntimeError as exc:
+            if not _is_search_rate_limit_error(exc):
+                raise SyncCollectionError(f"{label}: {exc}") from exc
+            if attempt >= SEARCH_MAX_RETRIES:
+                raise SyncCollectionError(
+                    f"{label}: rate limited after {attempt + 1} attempts: {exc}"
+                ) from exc
+            delay = _retry_after_seconds(exc, attempt)
+            warnings.append(
+                f"{label}: rate limited; retrying in {delay:g}s "
+                f"(attempt {attempt + 2}/{SEARCH_MAX_RETRIES + 1})"
+            )
+            time.sleep(delay)
+            continue
+
+        if result is None:
+            return []
+        if not isinstance(result, list):
+            raise SyncCollectionError(f"{label}: expected a JSON array from gh search")
+        return [item for item in result if isinstance(item, dict)]
+
+    # The loop either returns or raises.  Keep a defensive error for static
+    # type checkers and future changes to the retry policy.
+    raise SyncCollectionError(f"{label}: search did not return a result")
+
+
+def _append_search_count_warning(
+    warnings: list[str], label: str, result_count: int
+) -> None:
+    warning = f"{label}: {result_count} results"
+    if result_count >= SEARCH_RESULT_WARNING_THRESHOLD:
+        warning += " (near GitHub's 1,000-result limit; results may be truncated)"
+    warnings.append(warning)
+
+
 def fetch_search_threads(
     since_date: str,
     repos: Sequence[str] | None = None,
+    *,
+    search_orgs: Sequence[str] | None = None,
+    backfill: bool = False,
 ) -> tuple[list[ThreadRef], list[str]]:
-    """Find recently updated threads related to the authenticated user."""
+    """Find recently updated threads related to the authenticated user.
+
+    Global search is the primary discovery path.  ``repos`` remains as an
+    additive per-repository fallback for configurations that still need it.
+    """
     queries = [
         ("issues", "author"),
         ("issues", "assignee"),
+        ("issues", "commenter"),
         ("prs", "author"),
         ("prs", "assignee"),
         ("prs", "reviewed-by"),
+        ("prs", "commenter"),
     ]
     refs: dict[str, ThreadRef] = {}
     warnings: list[str] = []
-    fields = "number,repository,url,updatedAt"
-    selected_repos = (
-        tuple(repos) if repos is not None else resolve_config().mine_repos
+    settings = resolve_config()
+    selected_repos = tuple(repos) if repos is not None else settings.mine_repos
+    selected_orgs = (
+        tuple(search_orgs) if search_orgs is not None else settings.search_orgs
     )
+    limiter = _SearchRateLimiter(
+        interval_seconds=SEARCH_INTERVAL_SECONDS if backfill else 0.0,
+    )
+
+    global_scopes = selected_orgs or (None,)
+    for org in global_scopes:
+        for search_kind, qualifier in queries:
+            label = _search_label(search_kind, qualifier, org=org)
+            items = _run_search_query(
+                _search_args(search_kind, qualifier, since_date, org=org),
+                label,
+                limiter=limiter,
+                warnings=warnings,
+            )
+            _append_search_count_warning(warnings, label, len(items))
+            for item in items:
+                ref = search_thread_ref(
+                    item,
+                    "pr" if search_kind == "prs" else "issue",
+                )
+                if ref:
+                    refs[ref.key] = ref
+
     for repo in selected_repos:
         for search_kind, qualifier in queries:
-            try:
-                items = gh_cli_json([
-                    "search",
-                    search_kind,
-                    f"--{qualifier}",
-                    "@me",
-                    "--repo",
-                    repo,
-                    "--updated",
-                    f">={since_date}",
-                    "--sort",
-                    "updated",
-                    "--order",
-                    "desc",
-                    "--limit",
-                    "100",
-                    "--json",
-                    fields,
-                ]) or []
-            except RuntimeError as exc:
-                raise SyncCollectionError(
-                    f"gh search {search_kind} --{qualifier} --repo {repo}: {exc}"
-                ) from exc
+            label = _search_label(search_kind, qualifier, repo=repo)
+            items = _run_search_query(
+                _search_args(search_kind, qualifier, since_date, repo=repo),
+                label,
+                limiter=limiter,
+                warnings=warnings,
+            )
+            _append_search_count_warning(warnings, label, len(items))
             for item in items:
-                if not isinstance(item, dict):
-                    continue
-                ref = search_thread_ref(item, "pr" if search_kind == "prs" else "issue")
+                ref = search_thread_ref(
+                    item,
+                    "pr" if search_kind == "prs" else "issue",
+                )
                 if ref:
                     refs[ref.key] = ref
     return list(refs.values()), warnings
@@ -820,6 +1133,8 @@ def collect_event_records(
     bootstrap_days: int | None = None,
     overlap_minutes: int | None = None,
     mine_repos: Sequence[str] | None = None,
+    search_orgs: Sequence[str] | None = None,
+    backfill: bool = False,
     optimize_threads: bool | None = None,
     synced_threads: list[ThreadSyncBoundary] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
@@ -835,6 +1150,7 @@ def collect_event_records(
     ``since_days`` backfills keep their global cutoff so they can repair older
     data.
     """
+    backfill = backfill or since_days is not None
     if optimize_threads is None:
         optimize_threads = since_days is None
     if since_days is not None:
@@ -873,13 +1189,17 @@ def collect_event_records(
         refs[ref.key] = ref
         notifications_by_ref.setdefault(ref.key, []).append(notification)
 
-    if mine_repos is None:
-        search_refs, search_warnings = fetch_search_threads(cutoff.date().isoformat())
-    else:
-        search_refs, search_warnings = fetch_search_threads(
-            cutoff.date().isoformat(),
-            repos=mine_repos,
-        )
+    search_options: dict[str, Any] = {}
+    if mine_repos is not None:
+        search_options["repos"] = mine_repos
+    if search_orgs is not None:
+        search_options["search_orgs"] = search_orgs
+    if backfill:
+        search_options["backfill"] = True
+    search_refs, search_warnings = fetch_search_threads(
+        cutoff.date().isoformat(),
+        **search_options,
+    )
     warnings.extend(search_warnings)
     for ref in search_refs:
         refs[ref.key] = ref
@@ -897,6 +1217,15 @@ def collect_event_records(
         if kind not in ("issue", "pr"):
             kind = "issue"
         refs.setdefault(f"{repo}#{number}", ThreadRef(repo, number, kind))
+
+    try:
+        event_refs, event_warnings = fetch_user_event_threads(cutoff)
+    except Exception as exc:
+        warnings.append(f"events: {exc}" if str(exc) else f"events: {exc.__class__.__name__}")
+    else:
+        warnings.extend(event_warnings)
+        for ref in event_refs:
+            refs.setdefault(ref.key, ref)
 
     events: list[dict[str, Any]] = []
     for notification in fallback_notifications:
@@ -1218,6 +1547,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
     events, warnings, thread_count = collect_event_records(
         cutoff=cutoff,
         mine_repos=getattr(args, "mine_repos", None),
+        search_orgs=getattr(args, "search_orgs", None),
+        backfill=mode == "backfill",
         optimize_threads=mode == "incremental",
         synced_threads=synced_threads,
     )
@@ -1436,7 +1767,14 @@ def add_config_options(
         dest="mine_repos",
         action="append",
         default=default,
-        help="search discovery 対象 repo（複数回指定可）",
+        help="search discovery の追加 per-repo 対象（複数回指定可）",
+    )
+    parser.add_argument(
+        "--search-org",
+        dest="search_orgs",
+        action="append",
+        default=default,
+        help="global search の organization 絞り込み（複数回指定可）",
     )
     parser.add_argument(
         "--bootstrap-days",

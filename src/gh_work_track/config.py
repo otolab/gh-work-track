@@ -18,6 +18,7 @@ DEFAULT_MINE_REPOS = (
     "plaidev/karte-io-systems-ops",
     "otolab/my-logs",
 )
+DEFAULT_SEARCH_ORGS: tuple[str, ...] = ()
 DEFAULT_SYNC_BOOTSTRAP_DAYS = 7
 DEFAULT_SYNC_OVERLAP_MINUTES = 5
 
@@ -28,6 +29,8 @@ CONFIG_FILE_NAME = "config.yaml"
 
 DEFAULT_REPO_ENV = "GH_WORK_TRACK_DEFAULT_REPO"
 MINE_REPOS_ENV = "GH_WORK_TRACK_MINE_REPOS"
+SEARCH_ORGS_ENV = "GH_WORK_TRACK_SEARCH_ORGS"
+SEARCH_ORG_ENV = "GH_WORK_TRACK_SEARCH_ORG"
 SYNC_BOOTSTRAP_DAYS_ENV = "GH_WORK_TRACK_SYNC_BOOTSTRAP_DAYS"
 SYNC_OVERLAP_MINUTES_ENV = "GH_WORK_TRACK_SYNC_OVERLAP_MINUTES"
 
@@ -47,6 +50,7 @@ class Config:
     default_repo: str = DEFAULT_REPO
     mine_repos: tuple[str, ...] = DEFAULT_MINE_REPOS
     sync: SyncConfig = SyncConfig()
+    search_orgs: tuple[str, ...] = DEFAULT_SEARCH_ORGS
 
 
 def config_path() -> Path:
@@ -73,6 +77,21 @@ def _repo_list(value: Any, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise ConfigError(f"{field_name} は owner/repo の配列で指定してください")
     return tuple(_repo(item, f"{field_name}[{index}]") for index, item in enumerate(value))
+
+
+def _org(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{field_name} は organization 名の文字列で指定してください")
+    value = value.strip()
+    if not re.fullmatch(r"[^/\s]+", value):
+        raise ConfigError(f"{field_name} は organization 名で指定してください: {value!r}")
+    return value
+
+
+def _org_list(value: Any, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"{field_name} は organization 名の配列で指定してください")
+    return tuple(_org(item, f"{field_name}[{index}]") for index, item in enumerate(value))
 
 
 def _positive_int(value: Any, field_name: str, *, minimum: int) -> int:
@@ -121,6 +140,10 @@ def load_config(path: Path | str | None = None) -> Config:
         document.get("mine_repos", DEFAULT_MINE_REPOS),
         "mine_repos",
     )
+    search_orgs = _org_list(
+        document.get("search_orgs", DEFAULT_SEARCH_ORGS),
+        "search_orgs",
+    )
     sync_document = document.get("sync", {})
     if sync_document is None:
         sync_document = {}
@@ -138,7 +161,12 @@ def load_config(path: Path | str | None = None) -> Config:
             minimum=0,
         ),
     )
-    return Config(default_repo=default_repo, mine_repos=mine_repos, sync=sync)
+    return Config(
+        default_repo=default_repo,
+        mine_repos=mine_repos,
+        search_orgs=search_orgs,
+        sync=sync,
+    )
 
 
 def _first_env(*names: str) -> str | None:
@@ -154,10 +182,16 @@ def _env_repos(value: str) -> tuple[str, ...]:
     return _repo_list(repos, MINE_REPOS_ENV)
 
 
+def _env_orgs(value: str) -> tuple[str, ...]:
+    orgs = [part.strip() for part in re.split(r"[,\n]+", value) if part.strip()]
+    return _org_list(orgs, SEARCH_ORGS_ENV)
+
+
 def resolve_config(
     *,
     default_repo: str | None = None,
     mine_repos: Sequence[str] | None = None,
+    search_orgs: Sequence[str] | None = None,
     bootstrap_days: int | None = None,
     overlap_minutes: int | None = None,
 ) -> Config:
@@ -183,6 +217,16 @@ def resolve_config(
         )
     else:
         resolved_mine_repos = _repo_list(mine_repos, "--mine-repo")
+
+    if search_orgs is None:
+        env_search_orgs = _first_env(SEARCH_ORGS_ENV, SEARCH_ORG_ENV)
+        resolved_search_orgs = (
+            _env_orgs(env_search_orgs)
+            if env_search_orgs is not None
+            else file_config.search_orgs
+        )
+    else:
+        resolved_search_orgs = _org_list(search_orgs, "--search-org")
 
     if bootstrap_days is None:
         env_bootstrap_days = _first_env(
@@ -221,6 +265,7 @@ def resolve_config(
     return Config(
         default_repo=resolved_default_repo,
         mine_repos=resolved_mine_repos,
+        search_orgs=resolved_search_orgs,
         sync=SyncConfig(
             bootstrap_days=resolved_bootstrap_days,
             overlap_minutes=resolved_overlap_minutes,

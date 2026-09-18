@@ -4,8 +4,10 @@ from gh_work_track.config import (
     CONFIG_ENV,
     DEFAULT_MINE_REPOS,
     DEFAULT_REPO,
+    DEFAULT_SEARCH_ORGS,
     DEFAULT_SYNC_BOOTSTRAP_DAYS,
     DEFAULT_SYNC_OVERLAP_MINUTES,
+    SEARCH_ORGS_ENV,
     XDG_CONFIG_ENV,
     config_path,
     load_config,
@@ -18,6 +20,8 @@ CONFIG_VALUE_ENVIRONMENTS = (
     "GH_WORK_TRACK_REPO",
     "GH_WORK_TRACK_MINE_REPOS",
     "GH_WORK_TRACK_MINE_REPO",
+    "GH_WORK_TRACK_SEARCH_ORGS",
+    "GH_WORK_TRACK_SEARCH_ORG",
     "GH_WORK_TRACK_SYNC_BOOTSTRAP_DAYS",
     "GH_WORK_TRACK_BOOTSTRAP_DAYS",
     "GH_WORK_TRACK_SYNC_OVERLAP_MINUTES",
@@ -38,6 +42,7 @@ def test_missing_config_uses_existing_defaults(monkeypatch, tmp_path):
 
     assert settings.default_repo == DEFAULT_REPO
     assert settings.mine_repos == DEFAULT_MINE_REPOS
+    assert settings.search_orgs == DEFAULT_SEARCH_ORGS
     assert settings.sync.bootstrap_days == DEFAULT_SYNC_BOOTSTRAP_DAYS
     assert settings.sync.overlap_minutes == DEFAULT_SYNC_OVERLAP_MINUTES
 
@@ -58,6 +63,9 @@ default_repo: example/main
 mine_repos:
   - example/one
   - example/two
+search_orgs:
+  - example-org
+  - another-org
 sync:
   bootstrap_days: 14
   overlap_minutes: 2
@@ -69,6 +77,7 @@ sync:
 
     assert settings.default_repo == "example/main"
     assert settings.mine_repos == ("example/one", "example/two")
+    assert settings.search_orgs == ("example-org", "another-org")
     assert settings.sync.bootstrap_days == 14
     assert settings.sync.overlap_minutes == 2
 
@@ -79,6 +88,7 @@ def test_cli_overrides_environment_and_config(monkeypatch, tmp_path):
         """
 default_repo: config/main
 mine_repos: [config/repo]
+search_orgs: [config-org]
 sync:
   bootstrap_days: 14
   overlap_minutes: 2
@@ -88,6 +98,7 @@ sync:
     monkeypatch.setenv(CONFIG_ENV, str(config_file))
     monkeypatch.setenv("GH_WORK_TRACK_DEFAULT_REPO", "env/main")
     monkeypatch.setenv("GH_WORK_TRACK_MINE_REPOS", "env/one,env/two")
+    monkeypatch.setenv(SEARCH_ORGS_ENV, "env-org,other-org")
     monkeypatch.setenv("GH_WORK_TRACK_SYNC_BOOTSTRAP_DAYS", "21")
     monkeypatch.setenv("GH_WORK_TRACK_SYNC_OVERLAP_MINUTES", "4")
 
@@ -95,15 +106,18 @@ sync:
     from_cli = resolve_config(
         default_repo="cli/main",
         mine_repos=["cli/repo"],
+        search_orgs=["cli-org"],
         bootstrap_days=28,
         overlap_minutes=6,
     )
 
     assert from_environment.default_repo == "env/main"
     assert from_environment.mine_repos == ("env/one", "env/two")
+    assert from_environment.search_orgs == ("env-org", "other-org")
     assert from_environment.sync.bootstrap_days == 21
     assert from_environment.sync.overlap_minutes == 4
     assert from_cli.default_repo == "cli/main"
     assert from_cli.mine_repos == ("cli/repo",)
+    assert from_cli.search_orgs == ("cli-org",)
     assert from_cli.sync.bootstrap_days == 28
     assert from_cli.sync.overlap_minutes == 6

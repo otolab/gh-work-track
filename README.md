@@ -9,7 +9,7 @@
 | 機能 | 状態 |
 |---|---|
 | LanceDB スキーマ / `init` / `stats` / `daily` | ✅ |
-| `sync` / `collect`（notifications + watch + search → events） | ✅ |
+| `sync` / `collect`（notifications + watch + search + Events API → events） | ✅ |
 | `watch` / `list` / `drill` / `mark-seen` | ✅ |
 | `migrate`（my-logs プロトタイプ JSONL → LanceDB） | ✅ |
 | modular-prompt-extract 連携 | 🔜 別途 |
@@ -36,6 +36,8 @@ LanceDB 本体: `$GH_WORK_TRACK_HOME/lance/`
 
 ```yaml
 default_repo: owner/repo
+search_orgs:
+  - owner
 mine_repos:
   - owner/repo-a
   - owner/repo-b
@@ -44,18 +46,34 @@ sync:
   overlap_minutes: 5
 ```
 
-`default_repo` は数字だけの ref（例: `drill 123`）の解決先です。`mine_repos` は `list` の自分の open Issue/PR と sync の search discovery の対象リポジトリです。`bootstrap_days` は watermark がない初回の incremental sync、`overlap_minutes` は前回成功 sync からの巻き戻し幅に使います。
+`default_repo` は数字だけの ref（例: `drill 123`）の解決先です。`search_orgs` は sync のグローバル search を指定 organization に絞る任意設定で、未設定なら organization を限定しません。`mine_repos` は `list` の自分の open Issue/PR と、グローバル search を補完する追加の per-repo search の対象です。グローバル search が主経路なので、活動を見つけるためだけに全 repo を `mine_repos` へ列挙する必要はありません。`bootstrap_days` は watermark がない初回の incremental sync、`overlap_minutes` は前回成功 sync からの巻き戻し幅に使います。
 
-設定値ごとの環境変数と CLI フラグは次のとおりです。`--mine-repo` は複数回指定できます。`GH_WORK_TRACK_MINE_REPOS` はカンマ区切りで指定してください。
+設定値ごとの環境変数と CLI フラグは次のとおりです。`--mine-repo` と `--search-org` は複数回指定できます。リスト型の環境変数はカンマ区切りで指定してください。
 
 | 設定 | 環境変数 | CLI フラグ |
 |---|---|---|
 | `default_repo` | `GH_WORK_TRACK_DEFAULT_REPO` | `--default-repo OWNER/REPO` |
-| `mine_repos` | `GH_WORK_TRACK_MINE_REPOS` | `--mine-repo OWNER/REPO` |
+| `search_orgs` | `GH_WORK_TRACK_SEARCH_ORGS` | `--search-org ORG` |
+| `mine_repos`（追加 per-repo 経路） | `GH_WORK_TRACK_MINE_REPOS` | `--mine-repo OWNER/REPO` |
 | `sync.bootstrap_days` | `GH_WORK_TRACK_SYNC_BOOTSTRAP_DAYS` | `--bootstrap-days N` |
 | `sync.overlap_minutes` | `GH_WORK_TRACK_SYNC_OVERLAP_MINUTES` | `--overlap-minutes N` |
 
 値の優先順位は **フラグ > env > config > default** です。`sync --since N` は設定された bootstrap 日数ではなく、明示的な N 日の backfill として動作します。
+
+### sync の discovery とレート制限
+
+`sync` は `gh search` のグローバル検索を主経路として、次の条件を直近の更新日時に適用します。
+
+- Issue: `author` / `assignee` / `commenter`
+- Pull request: `author` / `assignee` / `reviewed-by` / `commenter`
+
+`search_orgs` を設定すると organization ごとに検索し、設定しない場合は全 organization が対象です。グローバル検索の結果に加えて、`mine_repos` に設定した repo も従来型の per-repo 検索で確認し、重複を統合します。
+
+検索の取りこぼしを補完するため、認証ユーザーの Events API（`users/{username}/events`）からも Issue、PR、コメント、レビューなどのイベントを抽出して結果に統合します。この API にはサーバー側の日付フィルタがないため、cutoff より前のイベントはクライアント側で除外します。取得できるのは直近約 300 イベントまでで、高活動量のアカウントでは古い活動が欠落する可能性があります。Events API の失敗は warning として扱い、search と notifications の結果で sync を継続します。
+
+追加 repo 用に `extra_repos` は導入しません。既存の `mine_repos` を追加経路として利用できます。
+
+検索結果は 1 クエリあたり GitHub の上限 1,000 件までです。各 qualifier の取得件数を sync の warning に出力し、900 件以上の場合は結果が切り捨てられる可能性を警告します。backfill（`sync --since N`）の検索は直列に実行し、呼び出し間隔を空けます。検索が 429/403 になった場合は Retry-After を使って上限回数まで再試行し、解消しなければ sync を失敗させます。失敗した sync は watermark を進めません。
 
 ## 使い方
 
