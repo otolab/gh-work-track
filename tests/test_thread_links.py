@@ -436,3 +436,40 @@ def test_inferred_daily_group_and_drill_show_inference_and_evidence():
 
     assert "#### Group anchor: `other/repo#10` [inferred]" in daily
     assert "evidence: Parent: https://github.com/other/repo/issues/10" in drill
+
+
+def test_drill_json_serializes_stored_body_link_timestamp(monkeypatch, tmp_path, capsys):
+    from gh_work_track import cli
+    from gh_work_track.db import WorkTrackDB
+
+    db_path = tmp_path / "lance"
+    database = WorkTrackDB(str(db_path))
+    database.init_tables()
+    database.upsert_thread_links([{
+        "from_thread_key": "owner/repo#10",
+        "to_thread_key": "other/repo#20",
+        "rel": "inferred_parent",
+        "source": "body",
+        "confidence": 0.3,
+        "evidence": "Parent: https://github.com/other/repo/issues/20",
+        "discovered_at": "2026-09-17T10:00:00Z",
+    }])
+
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_issue_or_pr",
+        lambda ref: {"title": "child", "state": "open", "updated_at": ""},
+    )
+    monkeypatch.setattr(github_ops, "fetch_comments", lambda ref, limit: [])
+    monkeypatch.setattr(github_ops, "fetch_timeline", lambda ref, **kwargs: [])
+
+    assert cli.main([
+        "--db", str(db_path),
+        "drill", "owner/repo#10",
+        "--no-mark-seen",
+        "--json",
+    ]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["links"][0]["evidence"].startswith("Parent:")
+    assert isinstance(payload["links"][0]["discovered_at"], str)

@@ -409,6 +409,31 @@ def snippet(text: str, limit: int = 160) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+def json_safe_value(value: Any) -> Any:
+    """Convert API/DB values into values accepted by ``json.dumps``.
+
+    LanceDB returns timestamp columns as ``pandas.Timestamp`` instances.
+    Those are datetime-like but are not JSON serializable by the standard
+    library.  Keep this small recursive normalizer at the CLI boundary so
+    stored link rows remain native values for markdown and DB callers.
+    """
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_value(item) for item in value]
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        try:
+            scalar = item_method()
+        except (TypeError, ValueError):
+            scalar = value
+        if scalar is not value:
+            return json_safe_value(scalar)
+    return value
+
+
 def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -2728,7 +2753,10 @@ def cmd_drill(args: argparse.Namespace) -> int:
     issue = fetch_issue_or_pr(ref)
     comments = fetch_comments(ref, args.comments)
     timeline = fetch_timeline(ref, per_page=max(30, args.comments * 2))
-    links = get_session().load_thread_links(thread_key_value=ref.key)
+    links = [
+        json_safe_value(link)
+        for link in get_session().load_thread_links(thread_key_value=ref.key)
+    ]
     assignments = _thread_group_assignments([ref])
     assignment = _assignment_for_key(ref.key, assignments)
     if not args.no_mark_seen:
