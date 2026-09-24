@@ -71,18 +71,28 @@ key = "owner/name#42"   # union / dedupe に使用
 
 ## Thread links と WorkGroup
 
-timeline の `cross-referenced` と `connected` は、イベントとは別に
-`thread_links` へ保存します。link の向きは `from_thread_key` →
-`to_thread_key`、`rel` は `cross_ref` / `blocks` / `blocked_by` など、
-`source` は現在のところ `timeline` です。同じ端点・関係・source の行は
-upsert され、再同期しても重複しません。
+timeline の `cross-referenced` と、端点を含む enriched payload の
+`connected` は、イベントとは別に `thread_links` へ保存します。link の向きは
+`from_thread_key` → `to_thread_key`、`rel` は `cross_ref` / `blocks` /
+`blocked_by` など、`source` は現在のところ `timeline` です。同じ端点・関係・
+source の行は upsert され、再同期しても重複しません。
+
+ただし GitHub REST の [documented `connected` event payload](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types#connected)
+には、イベント自身の `id` / `url` や commit 情報はありますが、接続先 Issue/PR
+の endpoint はありません。Phase 1 は追加 API を呼ばないため、通常の REST sync
+では `connected` から `blocks` / `blocked_by` を推測・保存しません。端点を持たない
+最近のイベントは warning に記録されます。端点を含む別経路の payload はライブラリ
+の抽出器で扱えますが、REST collector が生成するものではありません。
 
 WorkGroup の anchor 解決に使うのは意味が明確な `parent` 辺だけです。
 Phase 1 の parent 辺は子 → 親の向きで、親にイベントがなくても anchor として
-表示できます。`cross_ref` や依存辺は `related` として表示しますが、同じ
-グループにはしません。parent 辺が循環する場合は watch 登録、種別、番号の
-順で deterministic に anchor を選びます。無向 connected components / union-find
-は使いません。
+表示できます。Phase 1 では `parent_issue_url` を自動で parent 辺へ昇格しません。
+したがって MAILGUN のようにそのフィールドが `source.issue` に存在しても、実 sync
+で自動ロールアップは発生せず、Phase 2 まで待つ必要があります。手動で保存した
+parent 辺は通常どおり解決できます。`cross_ref` や依存辺は `related` として表示
+しますが、同じグループにはしません。parent 辺が循環する場合は watch 登録、種別、
+番号の順で deterministic に anchor を選びます。無向 connected components /
+union-find は使いません。
 
 通常の `daily` は従来どおりフラットです。`daily --group anchor`（`epic` も可）
 だけが日次イベントを anchor 配下へネストし、JSON では各イベントに

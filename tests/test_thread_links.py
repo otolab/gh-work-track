@@ -1,10 +1,23 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from datetime import date
+from datetime import date, datetime, timezone
 
 from gh_work_track import github_ops
+
+
+def _documented_connected_payload():
+    """The fields documented for REST issue-timeline ``connected`` events."""
+    return {
+        "id": 123,
+        "node_id": "MDExOlRpbWVMaW5lRXZlbnQxMjM=",
+        "url": "https://api.github.com/repos/owner/repo/issues/events/123",
+        "actor": {"login": "alice"},
+        "event": "connected",
+        "commit_id": None,
+        "commit_url": None,
+        "created_at": "2026-09-17T10:00:00Z",
+    }
 
 
 def test_cross_referenced_timeline_payload_extracts_source_issue():
@@ -31,7 +44,7 @@ def test_cross_referenced_timeline_payload_extracts_source_issue():
     }]
 
 
-def test_connected_timeline_payload_extracts_blocks_direction():
+def test_endpoint_bearing_connected_payload_extracts_blocks_direction():
     ref = github_ops.ThreadRef("owner/repo", 10, "issue")
     payload = {
         "event": "connected",
@@ -51,7 +64,7 @@ def test_connected_timeline_payload_extracts_blocks_direction():
     assert links[0]["source"] == "timeline"
 
 
-def test_connected_timeline_payload_extracts_blocked_by_direction():
+def test_endpoint_bearing_connected_payload_extracts_blocked_by_direction():
     ref = github_ops.ThreadRef("owner/repo", 10, "issue")
     payload = {
         "event": "connected",
@@ -68,6 +81,21 @@ def test_connected_timeline_payload_extracts_blocked_by_direction():
     assert links[0]["from_thread_key"] == "owner/repo#10"
     assert links[0]["to_thread_key"] == "owner/repo#11"
     assert links[0]["rel"] == "blocked_by"
+
+
+def test_documented_connected_payload_has_no_resolvable_endpoint():
+    ref = github_ops.ThreadRef("owner/repo", 10, "issue")
+    payload = _documented_connected_payload()
+
+    assert github_ops.timeline_link_records(ref, payload) == []
+    warning = github_ops.timeline_link_warning(
+        ref,
+        payload,
+        cutoff=datetime(2026, 9, 17, 9, tzinfo=timezone.utc),
+    )
+    assert warning is not None
+    assert "no resolvable endpoint" in warning
+    assert "blocks/blocked_by were not stored" in warning
 
 
 def test_collect_event_records_can_collect_links_alongside_events(monkeypatch, tmp_path):
@@ -144,7 +172,7 @@ def test_grouped_daily_is_nested_but_default_daily_stays_flat():
     assert "  - `owner/repo#11`" in grouped
 
 
-def test_sync_persists_timeline_links(monkeypatch, tmp_path, capsys):
+def test_sync_persists_endpoint_bearing_timeline_links(monkeypatch, tmp_path, capsys):
     from gh_work_track import cli
     from gh_work_track.db import WorkTrackDB
 
@@ -182,6 +210,39 @@ def test_sync_persists_timeline_links(monkeypatch, tmp_path, capsys):
     assert links[0]["from_thread_key"] == "owner/repo#10"
     assert links[0]["to_thread_key"] == "owner/repo#11"
     assert links[0]["rel"] == "blocks"
+
+
+def test_sync_does_not_persist_documented_connected_payload_without_endpoint(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from gh_work_track import cli
+    from gh_work_track.db import WorkTrackDB
+
+    ref = github_ops.ThreadRef("owner/repo", 10)
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([ref], []),
+    )
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda *args, **kwargs: [_documented_connected_payload()],
+    )
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref_arg: [])
+
+    assert cli.main(["--db", str(tmp_path / "lance"), "sync", "--since", "365", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    database = WorkTrackDB(str(tmp_path / "lance"))
+    assert database.thread_links() == []
+    assert output["link_count"] == 0
+    assert any("no resolvable endpoint" in warning for warning in output["warnings"])
 
 
 def test_daily_group_anchor_reads_stored_links_and_adds_json_anchor(tmp_path, capsys):

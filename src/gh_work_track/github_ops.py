@@ -569,6 +569,57 @@ def _connected_relation(
     return "blocks"
 
 
+def _connected_target(
+    ref: ThreadRef,
+    payload: dict[str, Any],
+) -> ThreadRef | None:
+    """Resolve an endpoint from an endpoint-bearing connected payload."""
+    for field_name in (
+        "subject",
+        "target",
+        "connected_issue",
+        "blocking_issue",
+        "blocked_issue",
+        "source",
+    ):
+        candidate = payload.get(field_name)
+        if candidate is None:
+            continue
+        target = _thread_ref_from_link_value(candidate, default_repo=ref.repo)
+        if target:
+            return target
+    return None
+
+
+def timeline_link_warning(
+    ref: ThreadRef,
+    payload: dict[str, Any],
+    *,
+    cutoff: datetime | None = None,
+) -> str | None:
+    """Explain why a recent connected event could not produce a link row.
+
+    The documented REST ``connected`` event has no issue/PR endpoint.  Do not
+    infer one from the event URL or commit fields; callers get an explicit
+    warning instead.  Endpoint-bearing payloads (for example, an adapter
+    using a richer API representation) remain supported by the parser.
+    """
+    event = str(payload.get("event", "")).strip().lower()
+    if event != "connected":
+        return None
+    if cutoff is not None:
+        timestamp = _timeline_timestamp(payload)
+        if timestamp is None or timestamp < normalize_datetime(cutoff):
+            return None
+    if _connected_target(ref, payload) is not None:
+        return None
+    event_id = payload.get("id") or payload.get("node_id") or "unknown"
+    return (
+        f"{ref.key}: connected timeline event {event_id} has no resolvable "
+        "endpoint in the documented REST payload; blocks/blocked_by were not stored"
+    )
+
+
 def timeline_link_records(
     ref: ThreadRef,
     payload: dict[str, Any],
@@ -579,7 +630,9 @@ def timeline_link_records(
     expressed from that thread's perspective: ``blocked_by`` means the
     current thread is blocked by the target, while ``blocks`` means it blocks
     the target.  No API call is made here; all target data must be in the
-    already fetched payload.
+    already fetched payload.  The documented REST ``connected`` shape does
+    not include that endpoint, so it produces no row; use
+    :func:`timeline_link_warning` to report that limitation.
     """
     event = str(payload.get("event", "")).strip().lower()
     discovered_at = _link_timestamp(payload)
@@ -601,20 +654,7 @@ def timeline_link_records(
 
     if event != "connected":
         return []
-    target_value = None
-    for field_name in (
-        "subject",
-        "target",
-        "connected_issue",
-        "blocking_issue",
-        "blocked_issue",
-        "source",
-    ):
-        candidate = payload.get(field_name)
-        if candidate is not None:
-            target_value = candidate
-            break
-    target = _thread_ref_from_link_value(target_value, default_repo=ref.repo)
+    target = _connected_target(ref, payload)
     if not target or target.key == ref.key:
         return []
     relation = _connected_relation(ref, target, payload)
@@ -1548,12 +1588,15 @@ def collect_event_records(
             if event
         ]
         if thread_links is not None:
-            thread_links.extend(
-                link
-                for item in timeline
-                for link in timeline_link_records(ref, item)
-                if _link_is_since(link, thread_cutoff)
-            )
+            for item in timeline:
+                warning = timeline_link_warning(ref, item, cutoff=thread_cutoff)
+                if warning and warning not in warnings:
+                    warnings.append(warning)
+                thread_links.extend(
+                    link
+                    for link in timeline_link_records(ref, item)
+                    if _link_is_since(link, thread_cutoff)
+                )
         has_recent_timeline_activity = any(
             event_is_since(event, thread_cutoff) for event in thread_events
         )
