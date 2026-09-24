@@ -261,7 +261,6 @@ query($owner: String!, $name: String!, $number: Int!) {
           title
           updatedAt
           repository { nameWithOwner }
-          pullRequest { number }
         }
       }
     }
@@ -296,13 +295,36 @@ def fetch_sub_issues(ref: ThreadRef) -> list[ThreadRef]:
     ])
     if not isinstance(result, dict):
         raise RuntimeError("expected a JSON object from GraphQL subIssues")
+
+    errors = result.get("errors")
+    if errors:
+        if isinstance(errors, list):
+            messages = []
+            for error in errors:
+                if isinstance(error, dict):
+                    message = error.get("message")
+                else:
+                    message = error
+                if message:
+                    messages.append(str(message))
+            detail = "; ".join(messages) or repr(errors)
+        else:
+            detail = str(errors)
+        raise RuntimeError(f"GraphQL subIssues API error: {detail}")
+
     data = result.get("data", result)
-    repository = data.get("repository") if isinstance(data, dict) else None
-    issue = repository.get("issue") if isinstance(repository, dict) else None
-    connection = issue.get("subIssues") if isinstance(issue, dict) else None
-    nodes = connection.get("nodes") if isinstance(connection, dict) else []
-    if nodes is None:
-        return []
+    if not isinstance(data, dict):
+        raise RuntimeError("GraphQL subIssues response has no data")
+    repository = data.get("repository")
+    if not isinstance(repository, dict):
+        raise RuntimeError("GraphQL subIssues response has no repository")
+    issue = repository.get("issue")
+    if not isinstance(issue, dict):
+        raise RuntimeError("GraphQL subIssues response has no issue")
+    connection = issue.get("subIssues")
+    if not isinstance(connection, dict):
+        raise RuntimeError("GraphQL subIssues response has no subIssues connection")
+    nodes = connection.get("nodes")
     if not isinstance(nodes, list):
         raise RuntimeError("expected subIssues.nodes to be an array")
 
@@ -322,9 +344,7 @@ def fetch_sub_issues(ref: ThreadRef) -> list[ThreadRef]:
         else:
             repo = ""
         repo = repo or ref.repo
-        pull_request = node.get("pullRequest")
-        kind = "pr" if pull_request else "issue"
-        child = ThreadRef(repo, number, kind)
+        child = ThreadRef(repo, number, "issue")
         refs[child.key] = child
     return list(refs.values())
 

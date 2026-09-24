@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -28,6 +29,73 @@ def _timeline_item_at(timestamp: datetime, item_id: int) -> dict:
         "user": {"login": "alice"},
         "body": f"event {item_id}",
     }
+
+
+def _sub_issues_response(*numbers: int) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "issue": {
+                    "subIssues": {
+                        "nodes": [
+                            {
+                                "number": number,
+                                "title": f"child {number}",
+                                "updatedAt": "2026-09-17T10:00:00Z",
+                                "repository": {
+                                    "nameWithOwner": "owner/repo",
+                                },
+                            }
+                            for number in numbers
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_fetch_sub_issues_uses_issue_fixture_and_valid_selection(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        github_ops,
+        "gh_cli_json",
+        lambda args: calls.append(args) or _sub_issues_response(169460, 169462),
+    )
+
+    refs = github_ops.fetch_sub_issues(
+        github_ops.ThreadRef("owner/repo", 169457)
+    )
+
+    assert [ref.key for ref in refs] == [
+        "owner/repo#169460",
+        "owner/repo#169462",
+    ]
+    assert len(calls) == 1
+    assert calls[0][:2] == ["api", "graphql"]
+    query = calls[0][calls[0].index("-f") + 1]
+    assert "subIssues" in query
+    assert "pullRequest" not in query
+
+
+def test_fetch_sub_issues_distinguishes_empty_nodes_and_graphql_errors(monkeypatch):
+    ref = github_ops.ThreadRef("owner/repo", 169457)
+    empty = _sub_issues_response()
+    monkeypatch.setattr(github_ops, "gh_cli_json", lambda args: empty)
+    assert github_ops.fetch_sub_issues(ref) == []
+
+    errors = {
+        "errors": [{"message": "Resource not accessible by integration"}],
+        "data": None,
+    }
+    monkeypatch.setattr(github_ops, "gh_cli_json", lambda args: errors)
+    with pytest.raises(RuntimeError, match="GraphQL subIssues API error"):
+        github_ops.fetch_sub_issues(ref)
+
+    malformed = {"data": {"repository": {"issue": {}}}}
+    monkeypatch.setattr(github_ops, "gh_cli_json", lambda args: malformed)
+    with pytest.raises(RuntimeError, match="no subIssues connection"):
+        github_ops.fetch_sub_issues(ref)
 
 
 def test_fetch_timeline_stops_after_old_page_when_order_is_newest_first(monkeypatch):
@@ -425,6 +493,14 @@ def test_metadata_parent_discovery_registers_anchor_without_parent_timeline(
     assert timeline_calls == [child_a.key, child_b.key]
     assert graphql_calls == []
 
+    # A second incremental sync reuses the child metadata watermark.  It
+    # still collects the normal timeline window, but does not refetch issue
+    # metadata or create another link row.
+    assert cli.main(["--db", str(db_path), "sync", "--json"]) == 0
+    capsys.readouterr()
+    assert issue_calls == [child_a.key, child_b.key, parent.key]
+    assert database.count_thread_links() == 2
+
     assert cli.main([
         "--db", str(db_path),
         "daily",
@@ -433,6 +509,151 @@ def test_metadata_parent_discovery_registers_anchor_without_parent_timeline(
     ]) == 0
     output = capsys.readouterr().out
     assert f"#### Group anchor: `{parent.key}`" in output
+
+
+def test_watch_parent_graphql_discovery_persists_child_without_watching_it(
+    monkeypatch, tmp_path, capsys
+):
+    from gh_work_track import cli
+
+    db_path = tmp_path / "lance"
+    parent = github_ops.ThreadRef("owner/repo", 169457)
+    child = github_ops.ThreadRef("owner/repo", 169460)
+    database = WorkTrackDB(str(db_path))
+    database.init_tables()
+    database.upsert_thread(
+        parent.repo,
+        parent.number,
+        title="watched parent",
+        is_watched=True,
+        watch_note="explicit",
+    )
+
+    issue_calls: list[str] = []
+    timeline_calls: list[str] = []
+    graphql_calls: list[list[str]] = []
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([], []),
+    )
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_issue_or_pr",
+        lambda ref: issue_calls.append(ref.key) or {"title": ref.key},
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "gh_cli_json",
+        lambda args: graphql_calls.append(args) or _sub_issues_response(child.number),
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda ref, *args, **kwargs: timeline_calls.append(ref.key) or [],
+    )
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+
+    assert cli.main(["--db", str(db_path), "sync", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    database = WorkTrackDB(str(db_path))
+    assert payload["thread_count"] == 2
+    assert database.get_thread(child.repo, child.number) is not None
+    links = database.thread_links()
+    assert len(links) == 1
+    assert links[0]["from_thread_key"] == child.key
+    assert links[0]["to_thread_key"] == parent.key
+    assert database.list_watched_threads()[0]["thread_key"] == parent.key
+    assert issue_calls == [parent.key, child.key]
+    assert timeline_calls == [parent.key, child.key]
+    assert len(graphql_calls) == 1
+
+
+def test_backfill_graphql_discovery_persists_child_and_anchor(
+    monkeypatch, tmp_path, capsys
+):
+    from gh_work_track import cli
+
+    db_path = tmp_path / "lance"
+    child = github_ops.ThreadRef("owner/repo", 169460)
+    parent = github_ops.ThreadRef("owner/repo", 169457)
+    parent_url = "https://api.github.com/repos/owner/repo/issues/169457"
+    issue_calls: list[str] = []
+    timeline_calls: list[str] = []
+    graphql_calls: list[list[str]] = []
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([child], []),
+    )
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+
+    def fetch_issue(ref):
+        issue_calls.append(ref.key)
+        if ref.key == child.key:
+            return {"title": "child", "parent_issue_url": parent_url}
+        return {"title": "parent"}
+
+    monkeypatch.setattr(github_ops, "fetch_issue_or_pr", fetch_issue)
+    monkeypatch.setattr(
+        github_ops,
+        "gh_cli_json",
+        lambda args: graphql_calls.append(args) or _sub_issues_response(child.number),
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda ref, *args, **kwargs: timeline_calls.append(ref.key) or [],
+    )
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+
+    assert cli.main([
+        "--db", str(db_path), "sync", "--since", "7", "--json"
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    database = WorkTrackDB(str(db_path))
+    assert payload["thread_count"] == 1
+    assert database.get_thread(child.repo, child.number) is not None
+    assert database.get_thread(parent.repo, parent.number) is not None
+    assert len(database.thread_links()) == 1
+    assert database.list_watched_threads() == []
+    assert issue_calls == [child.key, parent.key]
+    assert timeline_calls == [child.key]
+    assert len(graphql_calls) == 1
+
+
+def test_graphql_errors_are_sync_warnings(monkeypatch, tmp_path, capsys):
+    from gh_work_track import cli
+
+    db_path = tmp_path / "lance"
+    parent = github_ops.ThreadRef("owner/repo", 169457)
+    database = WorkTrackDB(str(db_path))
+    database.init_tables()
+    database.upsert_thread(parent.repo, parent.number, title="watched", is_watched=True)
+    error_response = {
+        "errors": [{"message": "Resource not accessible by integration"}],
+        "data": None,
+    }
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(github_ops, "fetch_search_threads", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(github_ops, "fetch_issue_or_pr", lambda ref: {"title": ref.key})
+    monkeypatch.setattr(github_ops, "gh_cli_json", lambda args: error_response)
+    monkeypatch.setattr(github_ops, "fetch_timeline", lambda *args, **kwargs: [])
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+
+    assert cli.main(["--db", str(db_path), "sync", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any("GraphQL subIssues API error" in warning for warning in payload["warnings"])
+    assert WorkTrackDB(str(db_path)).thread_links() == []
 
 
 def test_effective_thread_cutoff_uses_global_thread_and_db_floors(tmp_path):
