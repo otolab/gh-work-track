@@ -34,6 +34,26 @@ def test_init_and_stats(db: WorkTrackDB):
     assert stats["events"] == 0
     assert stats["threads"] == 0
     assert stats["sync_runs"] == 0
+    assert stats["thread_links"] == 0
+
+
+def test_thread_links_upsert_is_idempotent_and_updates_observation(db: WorkTrackDB):
+    first = {
+        "from_thread_key": "owner/repo#10",
+        "to_thread_key": "owner/repo#11",
+        "rel": "cross_ref",
+        "source": "timeline",
+        "confidence": 0.8,
+        "discovered_at": "2026-09-17T10:00:00Z",
+    }
+    newer = {**first, "confidence": 1.0, "discovered_at": "2026-09-17T11:00:00Z"}
+
+    assert db.upsert_thread_links([first]) == (1, 1)
+    assert db.upsert_thread_links([newer]) == (0, 1)
+    rows = db.thread_links(thread_key_value="owner/repo#10")
+    assert len(rows) == 1
+    assert rows[0]["confidence"] == 1.0
+    assert str(rows[0]["discovered_at"]).startswith("2026-09-17 11:00:00")
 
 
 def test_upsert_events_is_idempotent(db: WorkTrackDB):

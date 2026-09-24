@@ -9,7 +9,7 @@
 | 機能 | 状態 |
 |---|---|
 | LanceDB スキーマ / `init` / `stats` / `daily` | ✅ |
-| `sync` / `collect`（notifications + watch + search + Events API → events） | ✅ |
+| `sync` / `collect`（notifications + watch + search + Events API → events / thread_links） | ✅ |
 | `watch` / `list` / `drill` / `mark-seen` | ✅ |
 | `migrate`（my-logs プロトタイプ JSONL → LanceDB） | ✅ |
 | modular-prompt-extract 連携 | 🔜 別途 |
@@ -100,10 +100,13 @@ incremental sync では、前回成功 run の取得開始時刻を global cutof
 # 修復・初回のバックフィル例
 uv run gh-work-track sync --since 7
 
-# 一覧・深堀り
+# 一覧・深堀り（group anchor / 関連リンクも表示）
 uv run gh-work-track list --since 7
 uv run gh-work-track drill 170102
 uv run gh-work-track watch list
+
+# 親 anchor 配下にネストした日次表示（通常の daily はフラットのまま）
+uv run gh-work-track daily --since 7 --group anchor
 ```
 
 ## ドキュメント
@@ -127,6 +130,7 @@ uv run gh-work-track watch list
 |---|---|
 | `events` | GitHub イベント（dedup_key 一意） |
 | `threads` | watch / last-seen / 同期メタ |
+| `thread_links` | スレッド間の有向 link（端点・関係・source 一意） |
 | `sync_runs` | collect 実行ログ |
 
 ## 開発

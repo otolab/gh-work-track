@@ -15,9 +15,11 @@ from gh_work_track.schemas import (
     ALL_TABLES,
     EVENTS_TABLE,
     SYNC_RUNS_TABLE,
+    THREAD_LINKS_TABLE,
     THREADS_TABLE,
     events_schema,
     sync_runs_schema,
+    thread_links_schema,
     threads_schema,
 )
 
@@ -68,6 +70,7 @@ class WorkTrackDB:
         specs = {
             EVENTS_TABLE: events_schema(),
             THREADS_TABLE: threads_schema(),
+            THREAD_LINKS_TABLE: thread_links_schema(),
             SYNC_RUNS_TABLE: sync_runs_schema(),
         }
         for name, schema in specs.items():
@@ -119,6 +122,9 @@ class WorkTrackDB:
         self._create_scalar_index_if_missing(events, "thread_key", "BTREE")
         threads = self._get_table(THREADS_TABLE)
         self._create_scalar_index_if_missing(threads, "thread_key", "BTREE")
+        links = self._get_table(THREAD_LINKS_TABLE)
+        self._create_scalar_index_if_missing(links, "from_thread_key", "BTREE")
+        self._create_scalar_index_if_missing(links, "to_thread_key", "BTREE")
 
     @staticmethod
     def _create_scalar_index_if_missing(table, column: str, index_type: str) -> None:
@@ -195,6 +201,9 @@ class WorkTrackDB:
 
     def count_threads(self) -> int:
         return len(self._get_table(THREADS_TABLE).search().to_pandas())
+
+    def count_thread_links(self) -> int:
+        return len(self._get_table(THREAD_LINKS_TABLE).search().to_pandas())
 
     def count_sync_runs(self) -> int:
         return len(self._get_table(SYNC_RUNS_TABLE).search().to_pandas())
@@ -354,6 +363,85 @@ class WorkTrackDB:
         if df.empty:
             return []
         return df.sort_values("thread_key").to_dict(orient="records")
+
+    def normalize_thread_link(self, record: dict[str, Any]) -> dict[str, Any]:
+        discovered_at = record.get("discovered_at")
+        if discovered_at is None:
+            discovered_at = _now_ms()
+        elif not isinstance(discovered_at, pd.Timestamp):
+            discovered_at = pd.Timestamp(discovered_at).floor("ms")
+        return {
+            "from_thread_key": str(record.get("from_thread_key", "")),
+            "to_thread_key": str(record.get("to_thread_key", "")),
+            "rel": str(record.get("rel", "")),
+            "source": str(record.get("source", "")),
+            "confidence": float(record.get("confidence", 1.0)),
+            "discovered_at": discovered_at,
+        }
+
+    def upsert_thread_links(self, records: list[dict[str, Any]]) -> tuple[int, int]:
+        if not records:
+            return 0, self.count_thread_links()
+        unique: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for record in records:
+            normalized = self.normalize_thread_link(record)
+            key = (
+                normalized["from_thread_key"],
+                normalized["to_thread_key"],
+                normalized["rel"],
+                normalized["source"],
+            )
+            if all(key):
+                unique[key] = normalized
+        normalized_records = list(unique.values())
+        if not normalized_records:
+            return 0, self.count_thread_links()
+        table = self._get_table(THREAD_LINKS_TABLE)
+        existing_df = table.search().to_pandas()
+        existing = {
+            (
+                str(row["from_thread_key"]),
+                str(row["to_thread_key"]),
+                str(row["rel"]),
+                str(row["source"]),
+            )
+            for _, row in existing_df.iterrows()
+        }
+        table.merge_insert(
+            ["from_thread_key", "to_thread_key", "rel", "source"]
+        ).when_matched_update_all().when_not_matched_insert_all().execute(
+            normalized_records
+        )
+        return (
+            sum(key not in existing for key in unique),
+            self.count_thread_links(),
+        )
+
+    def thread_links(
+        self,
+        *,
+        thread_key_value: str | None = None,
+    ) -> list[dict[str, Any]]:
+        table = self._get_table(THREAD_LINKS_TABLE)
+        query = table.search()
+        if thread_key_value:
+            escaped = _escape_sql(thread_key_value)
+            query = query.where(
+                f"from_thread_key = '{escaped}' OR to_thread_key = '{escaped}'"
+            )
+        df = query.to_pandas()
+        if df.empty:
+            return []
+        return df.sort_values(
+            ["from_thread_key", "to_thread_key", "rel", "source"]
+        ).to_dict(orient="records")
+
+    # Descriptive alias for callers that prefer an explicit collection name.
+    list_thread_links = thread_links
+    get_thread_links = thread_links
+
+    def links_for_thread(self, thread_key_value: str) -> list[dict[str, Any]]:
+        return self.thread_links(thread_key_value=thread_key_value)
 
     def record_sync_run(
         self,
@@ -523,5 +611,6 @@ class WorkTrackDB:
             "tables": ALL_TABLES,
             "events": self.count_events(),
             "threads": self.count_threads(),
+            "thread_links": self.count_thread_links(),
             "sync_runs": self.count_sync_runs(),
         }
