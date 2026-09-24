@@ -99,9 +99,11 @@ sync では `blocks` / `blocked_by` を推測せず、端点不明の最近の�
 報告します。端点を含む enriched payload や手動登録の link はライブラリの WorkGroup
 解決で利用できます。
 
-また、MAILGUN の `source.issue.parent_issue_url` は Phase 1 では `parent` 辺へ自動昇格
-しません。そのため実 sync の MAILGUN 自動ロールアップ（例: 親 anchor 配下への表示）は
-Phase 2 まで発生しません。手動で登録した parent 辺のロールアップは対象です。
+REST Issue metadata の `parent_issue_url` は Phase 2 で `parent` 辺へ昇格します。
+そのため MAILGUN のように子 discovery だけで親を発見できるスレッドは、親自身に
+イベントがなくても `daily --group epic` の anchor 配下へ表示されます。発見した親は
+自動で watch には追加されません。`cross_ref` だけから親子関係を推測する処理は
+Phase 3 まで行いません。
 
 ### 修復・初回: `sync --since N`
 

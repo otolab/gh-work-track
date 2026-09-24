@@ -251,6 +251,104 @@ def gh_cli_json(args: list[str]) -> Any:
     return json.loads(result.stdout or "null")
 
 
+SUB_ISSUES_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 100) {
+        nodes {
+          number
+          title
+          updatedAt
+          repository { nameWithOwner }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def fetch_sub_issues(ref: ThreadRef) -> list[ThreadRef]:
+    """Return direct sub-issues for one parent using the GraphQL API.
+
+    REST issue metadata exposes a child's ``parent_issue_url`` but does not
+    enumerate a parent's children.  This intentionally small GraphQL path is
+    used only for explicit watch/backfill discovery, not for every metadata
+    lookup.
+    """
+    try:
+        owner, name = ref.repo.split("/", 1)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid repository for sub-issues: {ref.repo}") from exc
+    result = gh_cli_json([
+        "api",
+        "graphql",
+        "-f",
+        f"query={SUB_ISSUES_QUERY}",
+        "-f",
+        f"owner={owner}",
+        "-f",
+        f"name={name}",
+        "-F",
+        f"number={ref.number}",
+    ])
+    if not isinstance(result, dict):
+        raise RuntimeError("expected a JSON object from GraphQL subIssues")
+
+    errors = result.get("errors")
+    if errors:
+        if isinstance(errors, list):
+            messages = []
+            for error in errors:
+                if isinstance(error, dict):
+                    message = error.get("message")
+                else:
+                    message = error
+                if message:
+                    messages.append(str(message))
+            detail = "; ".join(messages) or repr(errors)
+        else:
+            detail = str(errors)
+        raise RuntimeError(f"GraphQL subIssues API error: {detail}")
+
+    data = result.get("data", result)
+    if not isinstance(data, dict):
+        raise RuntimeError("GraphQL subIssues response has no data")
+    repository = data.get("repository")
+    if not isinstance(repository, dict):
+        raise RuntimeError("GraphQL subIssues response has no repository")
+    issue = repository.get("issue")
+    if not isinstance(issue, dict):
+        raise RuntimeError("GraphQL subIssues response has no issue")
+    connection = issue.get("subIssues")
+    if not isinstance(connection, dict):
+        raise RuntimeError("GraphQL subIssues response has no subIssues connection")
+    nodes = connection.get("nodes")
+    if not isinstance(nodes, list):
+        raise RuntimeError("expected subIssues.nodes to be an array")
+
+    refs: dict[str, ThreadRef] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        try:
+            number = int(node.get("number"))
+        except (TypeError, ValueError):
+            continue
+        if number <= 0:
+            continue
+        repository_value = node.get("repository")
+        if isinstance(repository_value, dict):
+            repo = str(repository_value.get("nameWithOwner", ""))
+        else:
+            repo = ""
+        repo = repo or ref.repo
+        child = ThreadRef(repo, number, "issue")
+        refs[child.key] = child
+    return list(refs.values())
+
+
 def fetch_mine_open(repos: Sequence[str] | None = None) -> list[ThreadSummary]:
     """自分の open PR/Issue。通知が来ていない作業の補完用。list API の結果をそのまま使い API 呼び出しを抑える。"""
     selected_repos = (
@@ -741,12 +839,22 @@ def save_thread_links(links: list[dict[str, Any]]) -> tuple[int, int]:
 
 def _thread_group_assignments(
     thread_keys: Sequence[Any] | None = None,
+    *,
+    warnings: list[str] | None = None,
 ) -> dict[str, WorkGroupAssignment]:
     session = get_session()
+    refs = list(thread_keys or [])
+    thread_kinds = {
+        value.key: value.kind
+        for value in refs
+        if isinstance(value, ThreadRef)
+    }
     return resolve_work_groups(
         session.load_thread_links(),
         watch=session.load_watch_entries(),
-        thread_keys=thread_keys,
+        thread_keys=refs,
+        thread_kinds=thread_kinds,
+        warnings=warnings,
     )
 
 
@@ -784,6 +892,44 @@ def _apply_group_assignments(
 
 def fetch_issue_or_pr(ref: ThreadRef) -> dict[str, Any]:
     return gh_api(f"repos/{ref.repo}/issues/{ref.number}")
+
+
+def parent_ref_from_issue(ref: ThreadRef, issue: dict[str, Any]) -> ThreadRef | None:
+    """Resolve the official REST ``parent_issue_url`` field, if present."""
+    parent_url = issue.get("parent_issue_url") if isinstance(issue, dict) else None
+    if not parent_url:
+        return None
+    parent = _thread_ref_from_link_value(parent_url, default_repo=ref.repo)
+    if parent is None or parent.key == ref.key:
+        return None
+    return parent
+
+
+def _metadata_thread_needs_fetch(
+    ref: ThreadRef,
+    *,
+    backfill: bool,
+    parent_only: bool = False,
+) -> bool:
+    """Apply the same incremental boundary idea to issue metadata.
+
+    A normal incremental run fetches metadata for newly discovered threads
+    (or rows whose title has not been populated).  Backfill deliberately
+    refreshes it.  Parent-only rows have no collection watermark, so a
+    populated title is the fast-path cache for them.
+    """
+    existing = get_session().db.get_thread(ref.repo, ref.number)
+    if not existing:
+        return True
+    if not str(existing.get("title", "")):
+        return True
+    if parent_only:
+        return False
+    return backfill or not str(existing.get("last_synced_at", ""))
+
+
+def _metadata_discovered_at() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _timeline_timestamp(payload: dict[str, Any]) -> datetime | None:
@@ -1529,7 +1675,9 @@ def collect_event_records(
     warnings.extend(search_warnings)
     for ref in search_refs:
         refs[ref.key] = ref
-    for watched in load_watch():
+    watch_entries = load_watch()
+    watch_by_key: dict[str, dict[str, Any]] = {}
+    for watched in watch_entries:
         try:
             repo = str(watched["repo"])
             number = int(watched["number"])
@@ -1542,7 +1690,14 @@ def collect_event_records(
             continue
         if kind not in ("issue", "pr"):
             kind = "issue"
-        refs.setdefault(f"{repo}#{number}", ThreadRef(repo, number, kind))
+        key = f"{repo}#{number}"
+        watch_by_key[key] = {
+            "repo": repo,
+            "number": number,
+            "kind": kind,
+            "note": str(watched.get("note", "")),
+        }
+        refs.setdefault(key, ThreadRef(repo, number, kind))
 
     try:
         event_refs, event_warnings = fetch_user_event_threads(cutoff)
@@ -1552,6 +1707,146 @@ def collect_event_records(
         warnings.extend(event_warnings)
         for ref in event_refs:
             refs.setdefault(ref.key, ref)
+
+    # REST metadata is the authoritative source for child -> parent links.
+    # Keep the rows pending until event collection succeeds so a failed sync
+    # does not leave a half-written discovery cache.  Parent-only rows are
+    # intentionally not added to ``refs`` and therefore never incur timeline
+    # or comments calls in this pass.
+    pending_thread_metadata: dict[str, dict[str, Any]] = {}
+    metadata_queue: list[tuple[ThreadRef, bool]] = []
+    metadata_queued: set[str] = set()
+    metadata_seen: set[str] = set()
+    metadata_links_seen: set[tuple[str, str]] = set()
+    metadata_parent_refs: dict[str, ThreadRef] = {}
+
+    def stage_thread_metadata(
+        ref: ThreadRef,
+        issue: dict[str, Any] | None = None,
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        existing = get_session().db.get_thread(ref.repo, ref.number) or {}
+        if issue is None and not allow_empty and not existing:
+            return
+        key = ref.key
+        watch = watch_by_key.get(key)
+        title = str(
+            (issue or {}).get("title")
+            or existing.get("title", "")
+        )
+        pending_thread_metadata[key] = {
+            "ref": ref,
+            "kind": ref.kind,
+            "title": title,
+            "is_watched": bool(watch or existing.get("is_watched", False)),
+            "watch_note": str(
+                (watch or {}).get("note", existing.get("watch_note", ""))
+            ),
+        }
+
+    def enqueue_metadata(ref: ThreadRef, *, parent_only: bool) -> None:
+        key = ref.key
+        if key in metadata_seen or key in metadata_queued:
+            return
+        if not _metadata_thread_needs_fetch(
+            ref,
+            backfill=backfill,
+            parent_only=parent_only,
+        ):
+            return
+        metadata_queue.append((ref, parent_only))
+        metadata_queued.add(key)
+
+    def append_metadata_parent(child: ThreadRef, parent: ThreadRef) -> None:
+        link_key = (child.key, parent.key)
+        if link_key not in metadata_links_seen:
+            metadata_links_seen.add(link_key)
+            if thread_links is not None:
+                thread_links.append({
+                    "from_thread_key": child.key,
+                    "to_thread_key": parent.key,
+                    "rel": "parent",
+                    "source": "metadata",
+                    "confidence": 1.0,
+                    "discovered_at": _metadata_discovered_at(),
+                })
+        # Register the anchor even when its own event history is empty.  It
+        # is not a watch entry; only an explicitly watched parent is watched.
+        metadata_parent_refs[parent.key] = parent
+        stage_thread_metadata(parent, allow_empty=True)
+        enqueue_metadata(parent, parent_only=True)
+
+    def collect_metadata(ref: ThreadRef, *, parent_only: bool) -> None:
+        key = ref.key
+        metadata_queued.discard(key)
+        if key in metadata_seen:
+            return
+        metadata_seen.add(key)
+        try:
+            issue = fetch_issue_or_pr(ref)
+        except RuntimeError:
+            # Metadata is enrichment.  Timeline collection remains usable if
+            # the optional REST fast path is unavailable; a parent URL itself
+            # still results in an anchor row when it was already parsed.
+            return
+        if not isinstance(issue, dict):
+            issue = {}
+        if issue.get("pull_request"):
+            ref.kind = "pr"
+        parent = parent_ref_from_issue(ref, issue)
+        if parent is not None:
+            # A normal collected thread is materialized by the existing
+            # sync boundary path.  Stage the REST title here when this
+            # metadata lookup also discovered a parent, so the parent/child
+            # graph has useful labels without changing the no-parent path.
+            stage_thread_metadata(ref, issue)
+            append_metadata_parent(ref, parent)
+        elif parent_only:
+            # Parent-only metadata is the one case where a thread with no
+            # parent of its own must still retain its title in the cache.
+            stage_thread_metadata(ref, issue)
+
+    # Existing incremental rows with a populated title are already covered
+    # by their collection watermark.  New and backfill rows go through REST
+    # metadata before timeline collection.
+    for ref in list(refs.values()):
+        enqueue_metadata(ref, parent_only=False)
+    while metadata_queue:
+        ref, parent_only = metadata_queue.pop(0)
+        collect_metadata(ref, parent_only=parent_only)
+
+    # A parent watched by the user is an explicit request to discover its
+    # children.  Backfill is the repair mode where this extra enumeration is
+    # also allowed for discovered issue refs.  Incremental child metadata
+    # discovery above deliberately does not fan out through GraphQL.
+    graphql_targets: dict[str, ThreadRef] = {}
+    for key, watched in watch_by_key.items():
+        graphql_targets[key] = ThreadRef(
+            str(watched["repo"]),
+            int(watched["number"]),
+            str(watched["kind"]),
+        )
+    if backfill:
+        # A backfill may refresh the known anchor's sub-issue membership, but
+        # must not fan GraphQL out to every discovered child.  This keeps the
+        # expensive path bounded by explicit watch/anchor targets.
+        graphql_targets.update(metadata_parent_refs)
+    for parent in graphql_targets.values():
+        try:
+            sub_issues = fetch_sub_issues(parent)
+        except RuntimeError as exc:
+            warnings.append(f"{parent.key}: sub-issues discovery unavailable: {exc}")
+            continue
+        for child in sub_issues:
+            if child.key == parent.key:
+                continue
+            refs.setdefault(child.key, child)
+            append_metadata_parent(child, parent)
+            enqueue_metadata(child, parent_only=False)
+    while metadata_queue:
+        ref, parent_only = metadata_queue.pop(0)
+        collect_metadata(ref, parent_only=parent_only)
 
     events: list[dict[str, Any]] = []
     for notification in fallback_notifications:
@@ -1624,6 +1919,17 @@ def collect_event_records(
         events.extend(thread_events)
         if synced_threads is not None:
             synced_threads.append(ThreadSyncBoundary(ref, thread_sync_started_at))
+
+    for metadata in pending_thread_metadata.values():
+        ref = metadata["ref"]
+        get_session().db.upsert_thread(
+            ref.repo,
+            ref.number,
+            kind=str(metadata["kind"]),
+            title=str(metadata["title"]),
+            is_watched=bool(metadata["is_watched"]),
+            watch_note=str(metadata["watch_note"]),
+        )
 
     return deduplicate_events(events), warnings, len(refs)
 
@@ -1997,9 +2303,14 @@ def format_daily_markdown(
     events: list[dict[str, Any]],
     *,
     group_assignments: dict[str, WorkGroupAssignment] | None = None,
+    warnings: Sequence[str] | None = None,
 ) -> str:
     period = start.isoformat() if start == end else f"{start.isoformat()} ～ {end.isoformat()}"
     lines = [f"## gh-work-track daily ({period})", "", f"イベント: {len(events)} 件", ""]
+    if warnings:
+        lines.append("### 警告")
+        lines.extend(f"- {warning}" for warning in warnings)
+        lines.append("")
     if not events:
         lines.append("_該当なし（先に `sync --since N` を実行してください）_")
         return "\n".join(lines)
@@ -2052,9 +2363,11 @@ def cmd_daily(args: argparse.Namespace) -> int:
     start, end = daily_date_range(args)
     events = daily_events(start, end)
     group_mode = getattr(args, "group", "flat")
+    group_warnings: list[str] = []
     assignments = (
         _thread_group_assignments(
-            [event for event in events if _event_thread_key(event)]
+            [event for event in events if _event_thread_key(event)],
+            warnings=group_warnings,
         )
         if group_mode in {"anchor", "epic"}
         else None
@@ -2074,6 +2387,8 @@ def cmd_daily(args: argparse.Namespace) -> int:
             "count": len(events),
             "events": by_date,
         }
+        if group_warnings:
+            payload["warnings"] = group_warnings
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     else:
         print(format_daily_markdown(
@@ -2081,6 +2396,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
             end,
             events,
             group_assignments=assignments,
+            warnings=group_warnings,
         ))
     return 0
 

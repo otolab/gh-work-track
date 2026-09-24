@@ -80,3 +80,65 @@ def test_parent_branch_is_deterministic_and_watchable():
     )
 
     assert result[child].group_anchor == watched_parent
+
+
+def test_metadata_parent_beats_watched_manual_parent():
+    child = "owner/repo#50"
+    metadata_parent = "owner/repo#30"
+    watched_manual_parent = "owner/repo#40"
+    result = resolve_work_groups(
+        [
+            {
+                **link(child, metadata_parent, "parent"),
+                "source": "metadata",
+            },
+            link(child, watched_manual_parent, "parent"),
+        ],
+        watch=[watched_manual_parent],
+    )
+
+    assert result[child].group_anchor == metadata_parent
+
+
+def test_metadata_parent_wins_without_inferring_parent_from_cross_ref():
+    child = "owner/repo#50"
+    metadata_parent = "owner/repo#30"
+    cross_ref_target = "other/repo#40"
+    result = resolve_work_groups(
+        [
+            {
+                **link(child, metadata_parent, "parent"),
+                "source": "metadata",
+            },
+            {
+                **link(child, cross_ref_target, "cross_ref"),
+                "source": "timeline",
+            },
+        ],
+        watch=[cross_ref_target],
+    )
+
+    assert result[child].group_anchor == metadata_parent
+    assert result[cross_ref_target].group_anchor == cross_ref_target
+
+
+def test_parent_cycle_reports_warning_before_metadata_tiebreak():
+    first = "owner/repo#10"
+    metadata_parent = "owner/repo#20"
+    warnings: list[str] = []
+    result = resolve_work_groups(
+        [
+            {
+                **link(first, metadata_parent, "parent"),
+                "source": "metadata",
+            },
+            link(metadata_parent, first, "parent"),
+        ],
+        watch=[first],
+        warnings=warnings,
+    )
+
+    assert result[first].group_anchor == metadata_parent
+    assert result[metadata_parent].group_anchor == metadata_parent
+    assert len(warnings) == 1
+    assert "parent cycle detected" in warnings[0]
