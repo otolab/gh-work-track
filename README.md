@@ -9,7 +9,7 @@
 | 機能 | 状態 |
 |---|---|
 | LanceDB スキーマ / `init` / `stats` / `daily` | ✅ |
-| `sync` / `collect`（notifications + watch + search + Events API → events） | ✅ |
+| `sync` / `collect`（notifications + watch + search + Events API → events / thread_links） | ✅ |
 | `watch` / `list` / `drill` / `mark-seen` | ✅ |
 | `migrate`（my-logs プロトタイプ JSONL → LanceDB） | ✅ |
 | modular-prompt-extract 連携 | 🔜 別途 |
@@ -90,6 +90,19 @@ GitHub 側の discovery や通知が遅れてスレッドに載る場合は、�
 
 incremental sync では、前回成功 run の取得開始時刻を global cutoff の基準にし、スレッドごとの取得開始境界として記録した `last_synced_at` と DB 内の最新イベント時刻も cutoff の下限として使います。run が overlap を超えて長時間かかっても、スレッド取得開始後から run 完了までに発生したイベントは次回の対象に残ります。timeline に cutoff 以降の activity がないスレッドでは comments の取得を省略します。GitHub の timeline API は返却順を保証していないため、新→古と確認できたページだけ early stop を行い、古→新または順序不明の場合は取りこぼし防止のため全ページを取得します。
 
+### thread_links の Phase 1 制約
+
+`cross-referenced` の `source.issue` は `cross_ref` として保存されます。一方、GitHub
+REST の [documented `connected` event payload](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types#connected)
+には接続先 Issue/PR の endpoint が含まれません。追加 API を呼ばない Phase 1 の REST
+sync では `blocks` / `blocked_by` を推測せず、端点不明の最近のイベントを warning として
+報告します。端点を含む enriched payload や手動登録の link はライブラリの WorkGroup
+解決で利用できます。
+
+また、MAILGUN の `source.issue.parent_issue_url` は Phase 1 では `parent` 辺へ自動昇格
+しません。そのため実 sync の MAILGUN 自動ロールアップ（例: 親 anchor 配下への表示）は
+Phase 2 まで発生しません。手動で登録した parent 辺のロールアップは対象です。
+
 ### 修復・初回: `sync --since N`
 
 任意期間を取り直すときや初回のバックフィルには `sync --since N` を使います。これは backfill 専用で、watermark を使わず直近 `N` 日（`N >= 1`）を取得します。完了後の日常運用は、引数なしの `sync` に戻してください。
@@ -100,10 +113,13 @@ incremental sync では、前回成功 run の取得開始時刻を global cutof
 # 修復・初回のバックフィル例
 uv run gh-work-track sync --since 7
 
-# 一覧・深堀り
+# 一覧・深堀り（group anchor / 関連リンクも表示）
 uv run gh-work-track list --since 7
 uv run gh-work-track drill 170102
 uv run gh-work-track watch list
+
+# 親 anchor 配下にネストした日次表示（通常の daily はフラットのまま）
+uv run gh-work-track daily --since 7 --group anchor
 ```
 
 ## ドキュメント
@@ -127,6 +143,7 @@ uv run gh-work-track watch list
 |---|---|
 | `events` | GitHub イベント（dedup_key 一意） |
 | `threads` | watch / last-seen / 同期メタ |
+| `thread_links` | スレッド間の有向 link（端点・関係・source 一意） |
 | `sync_runs` | collect 実行ログ |
 
 ## 開発

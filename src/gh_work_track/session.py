@@ -149,6 +149,16 @@ class Session:
     def save_events(self, events: list[dict[str, Any]]) -> tuple[int, int]:
         return self.db.upsert_events(events)
 
+    def save_thread_links(self, links: list[dict[str, Any]]) -> tuple[int, int]:
+        return self.db.upsert_thread_links(links)
+
+    def load_thread_links(
+        self,
+        *,
+        thread_key_value: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.db.thread_links(thread_key_value=thread_key_value)
+
     def load_events_between(self, start: str, end: str) -> list[dict[str, Any]]:
         return self.db.events_between(start, end)
 

@@ -5,7 +5,7 @@ Usage:
   gh-work-track.py list [--since DAYS] [--all] [--watch] [--json]
   gh-work-track.py drill <ref> [--comments N] [--json]
   gh-work-track.py collect [--since DAYS] [--json]
-  gh-work-track.py daily (--date YYYY-MM-DD | --since DAYS) [--json]
+  gh-work-track.py daily (--date YYYY-MM-DD | --since DAYS) [--group flat|anchor|epic] [--json]
   gh-work-track.py watch {list|add|remove} [ref ...]
   gh-work-track.py mark-seen <ref>   # update last-seen after drill
 
@@ -41,6 +41,7 @@ from gh_work_track.config import (
     resolve_config,
 )
 from gh_work_track.session import get_session
+from gh_work_track.work_groups import WorkGroupAssignment, resolve_work_groups
 
 # Kept as public aliases for callers that imported the old constants. Runtime
 # behavior resolves the config file and overrides through ``resolve_config``.
@@ -127,6 +128,9 @@ class ThreadSummary:
     note: str = ""
     is_new_since_seen: bool = False
     sources: list[str] = field(default_factory=list)
+    group_anchor: str = ""
+    group_role: str = ""
+    related: list[str] = field(default_factory=list)
 
 
 def gh_api(path: str, *, paginate: bool = False) -> Any:
@@ -414,6 +418,275 @@ def timeline_event_record(ref: ThreadRef, payload: dict[str, Any]) -> dict[str, 
     )
 
 
+def _thread_ref_from_link_value(
+    value: Any,
+    *,
+    default_repo: str | None = None,
+) -> ThreadRef | None:
+    """Resolve the issue-like objects returned by timeline link events."""
+    if isinstance(value, ThreadRef):
+        return value
+    if isinstance(value, str):
+        match = re.search(
+            r"(?:https?://[^/]+/)?(?:repos/)?([^/\s]+/[^/#\s]+)/"
+            r"(issues|pulls)/(\d+)",
+            value,
+        )
+        if match:
+            return ThreadRef(
+                match.group(1),
+                int(match.group(3)),
+                "pr" if match.group(2) == "pulls" else "issue",
+            )
+        return None
+    if not isinstance(value, dict):
+        return None
+    for nested_name in ("issue", "pull_request", "subject", "target"):
+        nested = value.get(nested_name)
+        if isinstance(nested, dict):
+            resolved = _thread_ref_from_link_value(
+                nested,
+                default_repo=default_repo,
+            )
+            if resolved:
+                return resolved
+
+    number = value.get("number")
+    if number is None:
+        for url_name in ("url", "html_url", "issue_url", "pull_request_url"):
+            resolved = _thread_ref_from_link_value(
+                value.get(url_name),
+                default_repo=default_repo,
+            )
+            if resolved:
+                return resolved
+        return None
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return None
+    repo_value = value.get("repository") or value.get("repo")
+    if isinstance(repo_value, dict):
+        repo = repo_value.get("full_name") or repo_value.get("name")
+        if repo and "/" not in str(repo):
+            owner = repo_value.get("owner") or {}
+            owner_name = owner.get("login") if isinstance(owner, dict) else owner
+            repo = f"{owner_name}/{repo}" if owner_name else repo
+    else:
+        repo = repo_value
+    repo = str(repo or default_repo or "")
+    if "/" not in repo:
+        return None
+    value_type = str(value.get("type", "")).lower()
+    kind = "pr" if value.get("pull_request") or value_type in {
+        "pullrequest",
+        "pull_request",
+        "pr",
+        "pull",
+    } else "issue"
+    return ThreadRef(repo, number, kind)
+
+
+def _link_timestamp(payload: dict[str, Any]) -> str:
+    timestamp = next(
+        (
+            str(payload[field_name])
+            for field_name in ("created_at", "submitted_at", "updated_at")
+            if payload.get(field_name)
+        ),
+        None,
+    )
+    return timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalise_link_relation(value: Any) -> str | None:
+    relation = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if relation in {
+        "parent",
+        "cross_ref",
+        "cross_reference",
+        "cross_referenced",
+        "crossreferenced",
+    }:
+        return "parent" if relation == "parent" else "cross_ref"
+    if relation in {
+        "blocks",
+        "blocking",
+        "blocking_issue",
+        "blocking_added",
+    }:
+        return "blocks"
+    if relation in {
+        "blocked_by",
+        "blockedby",
+        "blocked",
+        "blocked_issue",
+        "blocked_by_added",
+    }:
+        return "blocked_by"
+    if relation in {"closes", "closed_by"}:
+        return "closes"
+    return None
+
+
+def _connected_relation(
+    ref: ThreadRef,
+    target: ThreadRef,
+    payload: dict[str, Any],
+) -> str:
+    containers: list[dict[str, Any]] = [payload]
+    for name in ("subject", "source", "target", "connection"):
+        value = payload.get(name)
+        if isinstance(value, dict):
+            containers.append(value)
+    for container in containers:
+        for field_name in (
+            "rel",
+            "relation",
+            "relationship",
+            "connection",
+            "direction",
+            "kind",
+            "type",
+        ):
+            relation = _normalise_link_relation(container.get(field_name))
+            if relation in {"blocks", "blocked_by"}:
+                return relation
+        if container.get("blocked_by") is True or container.get("is_blocked_by") is True:
+            return "blocked_by"
+        if container.get("blocking") is True or container.get("is_blocking") is True:
+            return "blocks"
+
+    # GitHub's REST ``connected`` payload has historically omitted the
+    # relationship label.  Keep a deterministic fallback for those payloads:
+    # a PR linked to an issue is treated as the blocking side, while an issue
+    # linked to a PR is treated as blocked by that PR.  Fixtures that carry an
+    # explicit relationship always take precedence above.
+    if ref.kind == "pr" and target.kind == "issue":
+        return "blocks"
+    if ref.kind == "issue" and target.kind == "pr":
+        return "blocked_by"
+    return "blocks"
+
+
+def _connected_target(
+    ref: ThreadRef,
+    payload: dict[str, Any],
+) -> ThreadRef | None:
+    """Resolve an endpoint from an endpoint-bearing connected payload."""
+    for field_name in (
+        "subject",
+        "target",
+        "connected_issue",
+        "blocking_issue",
+        "blocked_issue",
+        "source",
+    ):
+        candidate = payload.get(field_name)
+        if candidate is None:
+            continue
+        target = _thread_ref_from_link_value(candidate, default_repo=ref.repo)
+        if target:
+            return target
+    return None
+
+
+def timeline_link_warning(
+    ref: ThreadRef,
+    payload: dict[str, Any],
+    *,
+    cutoff: datetime | None = None,
+) -> str | None:
+    """Explain why a recent connected event could not produce a link row.
+
+    The documented REST ``connected`` event has no issue/PR endpoint.  Do not
+    infer one from the event URL or commit fields; callers get an explicit
+    warning instead.  Endpoint-bearing payloads (for example, an adapter
+    using a richer API representation) remain supported by the parser.
+    """
+    event = str(payload.get("event", "")).strip().lower()
+    if event != "connected":
+        return None
+    if cutoff is not None:
+        timestamp = _timeline_timestamp(payload)
+        if timestamp is None or timestamp < normalize_datetime(cutoff):
+            return None
+    if _connected_target(ref, payload) is not None:
+        return None
+    event_id = payload.get("id") or payload.get("node_id") or "unknown"
+    return (
+        f"{ref.key}: connected timeline event {event_id} has no resolvable "
+        "endpoint in the documented REST payload; blocks/blocked_by were not stored"
+    )
+
+
+def timeline_link_records(
+    ref: ThreadRef,
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Extract directed link rows from one GitHub timeline event.
+
+    The current timeline thread is the ``from`` endpoint.  The relation is
+    expressed from that thread's perspective: ``blocked_by`` means the
+    current thread is blocked by the target, while ``blocks`` means it blocks
+    the target.  No API call is made here; all target data must be in the
+    already fetched payload.  The documented REST ``connected`` shape does
+    not include that endpoint, so it produces no row; use
+    :func:`timeline_link_warning` to report that limitation.
+    """
+    event = str(payload.get("event", "")).strip().lower()
+    discovered_at = _link_timestamp(payload)
+    confidence = 1.0
+    if event == "cross-referenced":
+        source = payload.get("source")
+        source_issue = source.get("issue") if isinstance(source, dict) else None
+        target = _thread_ref_from_link_value(source_issue, default_repo=ref.repo)
+        if not target or target.key == ref.key:
+            return []
+        return [{
+            "from_thread_key": ref.key,
+            "to_thread_key": target.key,
+            "rel": "cross_ref",
+            "source": "timeline",
+            "confidence": confidence,
+            "discovered_at": discovered_at,
+        }]
+
+    if event != "connected":
+        return []
+    target = _connected_target(ref, payload)
+    if not target or target.key == ref.key:
+        return []
+    relation = _connected_relation(ref, target, payload)
+    return [{
+        "from_thread_key": ref.key,
+        "to_thread_key": target.key,
+        "rel": relation,
+        "source": "timeline",
+        "confidence": confidence,
+        "discovered_at": discovered_at,
+    }]
+
+
+# Public aliases make the extraction helper discoverable without coupling
+# callers to the storage-oriented name used by the sync implementation.
+extract_thread_links = timeline_link_records
+extract_timeline_links = timeline_link_records
+thread_link_records = timeline_link_records
+
+
+def timeline_link_record(
+    ref: ThreadRef,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the single link represented by a timeline payload, if any."""
+    records = timeline_link_records(ref, payload)
+    return records[0] if records else None
+
+
+thread_link_record = timeline_link_record
+
+
 def comment_event_record(ref: ThreadRef, payload: dict[str, Any]) -> dict[str, Any] | None:
     timestamp = payload.get("created_at") or payload.get("updated_at")
     source_id = payload.get("id") or payload.get("node_id")
@@ -460,6 +733,53 @@ def deduplicate_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def save_events(events: list[dict[str, Any]]) -> tuple[int, int]:
     return get_session().save_events(deduplicate_events(events))
+
+
+def save_thread_links(links: list[dict[str, Any]]) -> tuple[int, int]:
+    return get_session().save_thread_links(links)
+
+
+def _thread_group_assignments(
+    thread_keys: Sequence[Any] | None = None,
+) -> dict[str, WorkGroupAssignment]:
+    session = get_session()
+    return resolve_work_groups(
+        session.load_thread_links(),
+        watch=session.load_watch_entries(),
+        thread_keys=thread_keys,
+    )
+
+
+def _event_thread_key(event: dict[str, Any]) -> str | None:
+    repo = str(event.get("repo", ""))
+    number = event.get("number")
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return None
+    if not repo or number <= 0:
+        return None
+    return f"{repo}#{number}"
+
+
+def _assignment_for_key(
+    key: str,
+    assignments: dict[str, WorkGroupAssignment],
+) -> WorkGroupAssignment:
+    return assignments.get(key, WorkGroupAssignment(key, "anchor", []))
+
+
+def _apply_group_assignments(
+    items: Iterable[ThreadSummary],
+    assignments: dict[str, WorkGroupAssignment],
+) -> None:
+    for item in items:
+        if not item.ref.number:
+            continue
+        assignment = _assignment_for_key(item.ref.key, assignments)
+        item.group_anchor = assignment.group_anchor
+        item.group_role = assignment.group_role
+        item.related = list(assignment.related)
 
 
 def fetch_issue_or_pr(ref: ThreadRef) -> dict[str, Any]:
@@ -1108,6 +1428,11 @@ def event_is_since(record: dict[str, Any], cutoff: datetime) -> bool:
     return bool(timestamp and timestamp >= cutoff)
 
 
+def _link_is_since(record: dict[str, Any], cutoff: datetime) -> bool:
+    timestamp = parse_timestamp(str(record.get("discovered_at", "")))
+    return bool(timestamp and timestamp >= cutoff)
+
+
 def effective_thread_cutoff(
     ref: ThreadRef,
     global_cutoff: datetime,
@@ -1137,6 +1462,7 @@ def collect_event_records(
     backfill: bool = False,
     optimize_threads: bool | None = None,
     synced_threads: list[ThreadSyncBoundary] | None = None,
+    thread_links: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], int]:
     """Collect events at or after the effective sync cutoff.
 
@@ -1261,6 +1587,16 @@ def collect_event_records(
             for event in (timeline_event_record(ref, item) for item in timeline)
             if event
         ]
+        if thread_links is not None:
+            for item in timeline:
+                warning = timeline_link_warning(ref, item, cutoff=thread_cutoff)
+                if warning and warning not in warnings:
+                    warnings.append(warning)
+                thread_links.extend(
+                    link
+                    for link in timeline_link_records(ref, item)
+                    if _link_is_since(link, thread_cutoff)
+                )
         has_recent_timeline_activity = any(
             event_is_since(event, thread_cutoff) for event in thread_events
         )
@@ -1304,6 +1640,9 @@ def format_collect_markdown(
     cutoff: datetime | None = None,
     watermark: datetime | None = None,
     bootstrap: bool = False,
+    link_count: int | None = None,
+    new_link_count: int | None = None,
+    total_link_count: int | None = None,
 ) -> str:
     lines = [f"## gh-work-track collect ({datetime.now().strftime('%Y-%m-%d %H:%M')})", ""]
     if mode == "incremental" and cutoff is not None:
@@ -1320,6 +1659,11 @@ def format_collect_markdown(
     )
     lines.append(f"期間: {period} / 対象スレッド: {thread_count} 件")
     lines.append(f"取得イベント: {event_count} 件 / 新規保存: {new_count} 件 / 累積: {total_count} 件")
+    if link_count is not None:
+        lines.append(
+            f"取得リンク: {link_count} 件 / 新規保存: {new_link_count or 0} 件 / "
+            f"累積: {total_link_count or 0} 件"
+        )
     lines.append(f"保存先: `{default_db_path()}`")
     if warnings:
         lines.append("")
@@ -1419,7 +1763,13 @@ def collect_threads(
     return sorted(summaries.values(), key=lambda s: s.updated_at, reverse=True)
 
 
-def format_list_markdown(items: list[ThreadSummary], since_days: int, meta: str) -> str:
+def format_list_markdown(
+    items: list[ThreadSummary],
+    since_days: int,
+    meta: str,
+    *,
+    assignments: dict[str, WorkGroupAssignment] | None = None,
+) -> str:
     lines = [f"## gh-work-track list ({datetime.now().strftime('%Y-%m-%d %H:%M')})", ""]
     lines.append(f"期間: 直近 {since_days} 日 / 件数: {len(items)}")
     lines.append(f"ソース: {meta}")
@@ -1456,6 +1806,20 @@ def format_list_markdown(items: list[ThreadSummary], since_days: int, meta: str)
             lines.append(f"- **assignees**: {', '.join(s.assignees)}")
         if s.note:
             lines.append(f"- **watch note**: {s.note}")
+        if s.ref.number:
+            assignment = (
+                assignments.get(s.ref.key)
+                if assignments is not None
+                else None
+            )
+            group_anchor = assignment.group_anchor if assignment else s.group_anchor
+            group_role = assignment.group_role if assignment else s.group_role
+            related = assignment.related if assignment else tuple(s.related)
+            if not group_anchor:
+                group_anchor = s.ref.key
+            lines.append(f"- **group anchor**: `{group_anchor}` ({group_role or 'anchor'})")
+            if related:
+                lines.append(f"- **related**: {', '.join(f'`{key}`' for key in related)}")
         lines.append(f"- **updated**: {s.updated_at}")
         if s.latest_author:
             lines.append(f"- **最新**: @{s.latest_author}: {s.latest_snippet}")
@@ -1497,6 +1861,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         mine_repos=getattr(args, "mine_repos", None),
     )
     meta = list_meta_line(args)
+    assignments = _thread_group_assignments([s.ref for s in items])
+    _apply_group_assignments(items, assignments)
     if args.json:
         payload = []
         for s in items:
@@ -1514,10 +1880,13 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "latest_author": s.latest_author,
                 "latest_snippet": s.latest_snippet,
                 "url": s.ref.web_url if s.ref.number else None,
+                "group_anchor": s.group_anchor or (s.ref.key if s.ref.number else None),
+                "group_role": s.group_role or ("anchor" if s.ref.number else None),
+                "related": s.related,
             })
         print(json.dumps({"meta": meta, "items": payload}, ensure_ascii=False, indent=2))
     else:
-        print(format_list_markdown(items, args.since, meta))
+        print(format_list_markdown(items, args.since, meta, assignments=assignments))
     return 0
 
 
@@ -1544,6 +1913,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         watermark=last_successful,
     )
     synced_threads: list[ThreadSyncBoundary] = []
+    thread_links: list[dict[str, Any]] = []
     events, warnings, thread_count = collect_event_records(
         cutoff=cutoff,
         mine_repos=getattr(args, "mine_repos", None),
@@ -1551,8 +1921,10 @@ def cmd_collect(args: argparse.Namespace) -> int:
         backfill=mode == "backfill",
         optimize_threads=mode == "incremental",
         synced_threads=synced_threads,
+        thread_links=thread_links,
     )
     new_count, total_count = save_events(events)
+    new_link_count, total_link_count = save_thread_links(thread_links)
     finished_at = datetime.now(timezone.utc)
     get_session().mark_threads_synced(synced_threads, synced_at=finished_at)
     if args.json:
@@ -1564,6 +1936,9 @@ def cmd_collect(args: argparse.Namespace) -> int:
             "event_count": len(events),
             "new_count": new_count,
             "total_count": total_count,
+            "link_count": len(thread_links),
+            "new_link_count": new_link_count,
+            "total_link_count": total_link_count,
             "db_path": str(default_db_path()),
             "warnings": warnings,
         }, ensure_ascii=False, indent=2))
@@ -1579,6 +1954,9 @@ def cmd_collect(args: argparse.Namespace) -> int:
             cutoff=cutoff,
             watermark=last_successful,
             bootstrap=metadata["bootstrap"],
+            link_count=len(thread_links),
+            new_link_count=new_link_count,
+            total_link_count=total_link_count,
         ))
     return 0
 
@@ -1602,11 +1980,60 @@ def daily_events(start: date, end: date) -> list[dict[str, Any]]:
     return get_session().load_events_between(start.isoformat(), end.isoformat())
 
 
-def format_daily_markdown(start: date, end: date, events: list[dict[str, Any]]) -> str:
+def _daily_event_line(event: dict[str, Any], *, indent: str = "") -> str:
+    actor = str(event.get("actor", ""))
+    actor_text = f" by @{actor}" if actor and actor != "?" else ""
+    body = f" — {event['snippet']}" if event.get("snippet") else ""
+    return (
+        f"{indent}- `{event.get('repo', '?')}#{event.get('number', '?')}` "
+        f"({event.get('kind', 'issue')}) **{event.get('event', 'event')}**"
+        f"{actor_text}{body} — {event.get('url', '')}"
+    )
+
+
+def format_daily_markdown(
+    start: date,
+    end: date,
+    events: list[dict[str, Any]],
+    *,
+    group_assignments: dict[str, WorkGroupAssignment] | None = None,
+) -> str:
     period = start.isoformat() if start == end else f"{start.isoformat()} ～ {end.isoformat()}"
     lines = [f"## gh-work-track daily ({period})", "", f"イベント: {len(events)} 件", ""]
     if not events:
         lines.append("_該当なし（先に `sync --since N` を実行してください）_")
+        return "\n".join(lines)
+
+    if group_assignments is not None:
+        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for event in events:
+            key = _event_thread_key(event) or ""
+            assignment = _assignment_for_key(key, group_assignments)
+            grouped.setdefault(str(event.get("date", "")), {}).setdefault(
+                assignment.group_anchor, []
+            ).append(event)
+        for event_day, by_anchor in grouped.items():
+            if event_day:
+                lines.append(f"### {event_day}")
+            for anchor, anchor_events in by_anchor.items():
+                lines.append(f"#### Group anchor: `{anchor}`")
+                for event in anchor_events:
+                    lines.append(_daily_event_line(event, indent="  "))
+                related = sorted({
+                    related_key
+                    for event in anchor_events
+                    for related_key in _assignment_for_key(
+                        _event_thread_key(event) or "", group_assignments
+                    ).related
+                    if related_key != anchor
+                })
+                if related:
+                    lines.append(f"  - related: {', '.join(f'`{key}`' for key in related)}")
+                lines.append("")
+            if lines[-1] == "":
+                continue
+        if lines[-1] == "":
+            lines.pop()
         return "\n".join(lines)
 
     current_date = ""
@@ -1617,40 +2044,65 @@ def format_daily_markdown(start: date, end: date, events: list[dict[str, Any]]) 
                 lines.append("")
             lines.append(f"### {event_day}")
             current_date = event_day
-        actor = str(event.get("actor", ""))
-        actor_text = f" by @{actor}" if actor and actor != "?" else ""
-        body = f" — {event['snippet']}" if event.get("snippet") else ""
-        lines.append(
-            f"- `{event.get('repo', '?')}#{event.get('number', '?')}` "
-            f"({event.get('kind', 'issue')}) **{event.get('event', 'event')}**"
-            f"{actor_text}{body} — {event.get('url', '')}"
-        )
+        lines.append(_daily_event_line(event))
     return "\n".join(lines)
 
 
 def cmd_daily(args: argparse.Namespace) -> int:
     start, end = daily_date_range(args)
     events = daily_events(start, end)
+    group_mode = getattr(args, "group", "flat")
+    assignments = (
+        _thread_group_assignments(
+            [event for event in events if _event_thread_key(event)]
+        )
+        if group_mode in {"anchor", "epic"}
+        else None
+    )
     if args.json:
         by_date: dict[str, list[dict[str, Any]]] = {}
         for event in events:
-            by_date.setdefault(str(event.get("date", "")), []).append(event)
-        print(json.dumps({
+            output_event = dict(event)
+            if assignments is not None:
+                key = _event_thread_key(event) or ""
+                assignment = _assignment_for_key(key, assignments)
+                output_event.update(assignment.as_dict())
+            by_date.setdefault(str(event.get("date", "")), []).append(output_event)
+        payload: dict[str, Any] = {
             "from": start.isoformat(),
             "to": end.isoformat(),
             "count": len(events),
             "events": by_date,
-        }, ensure_ascii=False, indent=2))
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     else:
-        print(format_daily_markdown(start, end, events))
+        print(format_daily_markdown(
+            start,
+            end,
+            events,
+            group_assignments=assignments,
+        ))
     return 0
 
 
-def format_drill_markdown(ref: ThreadRef, issue: dict[str, Any], comments: list[dict[str, Any]], timeline: list[dict[str, Any]]) -> str:
+def format_drill_markdown(
+    ref: ThreadRef,
+    issue: dict[str, Any],
+    comments: list[dict[str, Any]],
+    timeline: list[dict[str, Any]],
+    *,
+    assignment: WorkGroupAssignment | None = None,
+) -> str:
     lines = [f"## drill: {ref.key}", ""]
     lines.append(f"**{issue.get('title', '')}**")
     lines.append(f"- state: {issue.get('state')}")
     lines.append(f"- url: {ref.web_url}")
+    if assignment is not None:
+        lines.append(f"- group anchor: `{assignment.group_anchor}` ({assignment.group_role})")
+        if assignment.related:
+            lines.append(
+                f"- related: {', '.join(f'`{key}`' for key in assignment.related)}"
+            )
     labels = [l["name"] for l in issue.get("labels", [])]
     if labels:
         lines.append(f"- labels: {', '.join(labels)}")
@@ -1696,17 +2148,26 @@ def cmd_drill(args: argparse.Namespace) -> int:
     issue = fetch_issue_or_pr(ref)
     comments = fetch_comments(ref, args.comments)
     timeline = fetch_timeline(ref, per_page=max(30, args.comments * 2))
+    assignments = _thread_group_assignments([ref])
+    assignment = _assignment_for_key(ref.key, assignments)
     if not args.no_mark_seen:
         mark_seen(ref, issue.get("updated_at"))
     if args.json:
         print(json.dumps({
             "ref": ref.key,
+            **assignment.as_dict(),
             "issue": issue,
             "comments": comments,
             "timeline": timeline,
         }, ensure_ascii=False, indent=2))
     else:
-        print(format_drill_markdown(ref, issue, comments, timeline))
+        print(format_drill_markdown(
+            ref,
+            issue,
+            comments,
+            timeline,
+            assignment=assignment,
+        ))
     return 0
 
 
@@ -1826,6 +2287,12 @@ def build_parser() -> argparse.ArgumentParser:
     daily_period = dap.add_mutually_exclusive_group(required=True)
     daily_period.add_argument("--date", help="対象日 (YYYY-MM-DD)")
     daily_period.add_argument("--since", type=int, help="直近の日数（今日を含む）")
+    dap.add_argument(
+        "--group",
+        choices=("flat", "anchor", "epic"),
+        default="flat",
+        help="表示単位（default: flat; anchor/epic で parent anchor 配下にネスト）",
+    )
     dap.add_argument("--json", action="store_true")
     dap.set_defaults(func=cmd_daily)
 

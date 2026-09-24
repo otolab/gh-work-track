@@ -4,9 +4,10 @@ import pyarrow as pa
 
 EVENTS_TABLE = "events"
 THREADS_TABLE = "threads"
+THREAD_LINKS_TABLE = "thread_links"
 SYNC_RUNS_TABLE = "sync_runs"
 
-ALL_TABLES = [EVENTS_TABLE, THREADS_TABLE, SYNC_RUNS_TABLE]
+ALL_TABLES = [EVENTS_TABLE, THREADS_TABLE, THREAD_LINKS_TABLE, SYNC_RUNS_TABLE]
 
 
 def events_schema() -> pa.Schema:
@@ -43,6 +44,19 @@ def threads_schema() -> pa.Schema:
             pa.field("last_seen_at", pa.string()),
             pa.field("last_synced_at", pa.string()),
             pa.field("updated_at", pa.timestamp("ms")),
+        ]
+    )
+
+
+def thread_links_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("from_thread_key", pa.string()),
+            pa.field("to_thread_key", pa.string()),
+            pa.field("rel", pa.string()),
+            pa.field("source", pa.string()),
+            pa.field("confidence", pa.float64()),
+            pa.field("discovered_at", pa.timestamp("ms")),
         ]
     )
 

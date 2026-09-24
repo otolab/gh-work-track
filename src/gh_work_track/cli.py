@@ -20,6 +20,7 @@ from gh_work_track.github_ops import (
     format_collect_markdown,
     resolve_sync_cutoff,
     save_events,
+    save_thread_links,
     sync_output_metadata,
 )
 from gh_work_track.migrate import migrate_legacy
@@ -153,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
             synced_threads = []
             thread_state = {}
             try:
+                thread_links = []
                 events, warnings, thread_count = collect_event_records(
                     cutoff=cutoff,
                     mine_repos=getattr(args, "mine_repos", None),
@@ -160,8 +162,10 @@ def main(argv: list[str] | None = None) -> int:
                     backfill=mode == "backfill",
                     optimize_threads=mode == "incremental",
                     synced_threads=synced_threads,
+                    thread_links=thread_links,
                 )
                 new_count, total_count = save_events(events)
+                new_link_count, total_link_count = save_thread_links(thread_links)
                 thread_state = session.capture_thread_state(synced_threads)
                 finished_at = datetime.now(timezone.utc)
                 session.mark_threads_synced(synced_threads, synced_at=finished_at)
@@ -173,6 +177,9 @@ def main(argv: list[str] | None = None) -> int:
                     "event_count": len(events),
                     "new_count": new_count,
                     "total_count": total_count,
+                    "link_count": len(thread_links),
+                    "new_link_count": new_link_count,
+                    "total_link_count": total_link_count,
                     "db_path": str(db_path(args.db)),
                     "warnings": warnings,
                 }
@@ -187,6 +194,9 @@ def main(argv: list[str] | None = None) -> int:
                     cutoff=cutoff,
                     watermark=last_successful,
                     bootstrap=metadata["bootstrap"],
+                    link_count=len(thread_links),
+                    new_link_count=new_link_count,
+                    total_link_count=total_link_count,
                 )
                 session.db.update_sync_run(
                     run_id,
