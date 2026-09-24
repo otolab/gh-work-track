@@ -64,6 +64,13 @@ SEARCH_MAX_RETRY_WAIT_SECONDS = 300.0
 EVENTS_RESULT_LIMIT = 300
 EVENTS_RESULT_WARNING_THRESHOLD = 270
 
+# Body links are intentionally weaker than REST metadata/timeline links.  The
+# values are kept as floats because ``thread_links.confidence`` is the public
+# storage contract and callers can use them for filtering.
+BODY_PARENT_CONFIDENCE = 0.3
+BODY_REFERENCE_CONFIDENCE = 0.6
+BODY_CLOSES_CONFIDENCE = 0.6
+
 REASON_JA = {
     "review_requested": "レビュー依頼",
     "mention": "メンション",
@@ -402,6 +409,31 @@ def snippet(text: str, limit: int = 160) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+def json_safe_value(value: Any) -> Any:
+    """Convert API/DB values into values accepted by ``json.dumps``.
+
+    LanceDB returns timestamp columns as ``pandas.Timestamp`` instances.
+    Those are datetime-like but are not JSON serializable by the standard
+    library.  Keep this small recursive normalizer at the CLI boundary so
+    stored link rows remain native values for markdown and DB callers.
+    """
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_value(item) for item in value]
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        try:
+            scalar = item_method()
+        except (TypeError, ValueError):
+            scalar = value
+        if scalar is not value:
+            return json_safe_value(scalar)
+    return value
+
+
 def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -527,14 +559,14 @@ def _thread_ref_from_link_value(
     if isinstance(value, str):
         match = re.search(
             r"(?:https?://[^/]+/)?(?:repos/)?([^/\s]+/[^/#\s]+)/"
-            r"(issues|pulls)/(\d+)",
+            r"(issues|pulls|pull)/(\d+)",
             value,
         )
         if match:
             return ThreadRef(
                 match.group(1),
                 int(match.group(3)),
-                "pr" if match.group(2) == "pulls" else "issue",
+                "pr" if match.group(2) in {"pulls", "pull"} else "issue",
             )
         return None
     if not isinstance(value, dict):
@@ -583,6 +615,147 @@ def _thread_ref_from_link_value(
         "pull",
     } else "issue"
     return ThreadRef(repo, number, kind)
+
+
+# Only these URL forms are accepted as body references.  Keeping the host
+# explicit prevents a random URL containing an ``issues/<number>`` path from
+# becoming a thread link, while supporting both browser and REST URLs.
+_BODY_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/"
+    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pulls?)/\d+"
+    r"|https?://api\.github\.com/repos/"
+    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pulls?)/\d+",
+    re.IGNORECASE,
+)
+_BODY_BARE_REF_RE = re.compile(r"(?<![A-Za-z0-9_])#([1-9]\d*)\b")
+_BODY_KEYWORD_RE = re.compile(
+    r"(?P<parent>\bparent\s*[:：]|親\s*[:：])"
+    r"|(?P<reference>\brefs?\s*[:：]|\brelated\s*[:：]|関連\s*[:：])"
+    r"|(?P<closes>\b(?:closes|fixes)\b)",
+    re.IGNORECASE,
+)
+
+
+def _body_link_target_values(text: str, *, repo: str) -> list[ThreadRef]:
+    """Return unique URL and same-repository shorthand targets in ``text``."""
+    targets: list[ThreadRef] = []
+    seen: set[str] = set()
+
+    url_matches = list(_BODY_URL_RE.finditer(text))
+    for match in url_matches:
+        candidate = match.group(0).rstrip(".,;:!?)]}>\"'")
+        target = _thread_ref_from_link_value(candidate, default_repo=repo)
+        if target and target.key not in seen:
+            seen.add(target.key)
+            targets.append(target)
+
+    # Do not interpret a numeric URL fragment (``.../issues/1#2``) as a
+    # second same-repository shorthand reference.
+    bare_text = _BODY_URL_RE.sub(" ", text)
+    for match in _BODY_BARE_REF_RE.finditer(bare_text):
+        target = ThreadRef(repo, int(match.group(1)), "issue")
+        if target.key not in seen:
+            seen.add(target.key)
+            targets.append(target)
+    return targets
+
+
+def body_link_records(
+    ref: ThreadRef,
+    body: str,
+    *,
+    discovered_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """Extract conservative, auditable links from issue/PR body text.
+
+    Bare ``#N`` references are considered only on lines with an explicit
+    relationship keyword.  Full GitHub Issue/PR URLs may also stand alone and
+    default to ``inferred_ref``.  Fenced and indented code is ignored so code
+    examples cannot accidentally create links.  The matched line is retained
+    as ``evidence`` for the drill view.
+    """
+    if not body:
+        return []
+
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    in_fence = False
+    for raw_line in str(body).splitlines():
+        stripped = raw_line.strip()
+        if re.match(r"^(?:```|~~~)", stripped):
+            in_fence = not in_fence
+            continue
+        if in_fence or raw_line.startswith(("    ", "\t")):
+            continue
+
+        evidence = snippet(raw_line)
+        # Inline code is evidence, not prose.  Mask it before keyword/URL
+        # matching while retaining the original line for the audit snippet.
+        parse_line = re.sub(
+            r"`[^`]*`",
+            lambda match: " " * len(match.group(0)),
+            raw_line,
+        )
+        keyword_matches = list(_BODY_KEYWORD_RE.finditer(parse_line))
+        segments: list[tuple[str, str]] = []
+        if keyword_matches:
+            for index, match in enumerate(keyword_matches):
+                end = (
+                    keyword_matches[index + 1].start()
+                    if index + 1 < len(keyword_matches)
+                    else len(parse_line)
+                )
+                kind = match.lastgroup or "reference"
+                segments.append((kind, parse_line[match.end():end]))
+        elif _BODY_URL_RE.search(parse_line):
+            # A URL without a keyword is still useful as a low-risk explicit
+            # cross-repository reference.  Bare #N remains disallowed here.
+            segments.append(("reference", parse_line))
+        else:
+            continue
+
+        for keyword, segment in segments:
+            if keyword == "parent":
+                rel = "inferred_parent"
+                confidence = BODY_PARENT_CONFIDENCE
+            elif keyword == "closes":
+                # GitHub's closing syntax is meaningful for PR bodies.  Do
+                # not turn an Issue's prose into a closing edge.
+                if ref.kind != "pr":
+                    continue
+                rel = "closes"
+                confidence = BODY_CLOSES_CONFIDENCE
+            else:
+                rel = "inferred_ref"
+                confidence = BODY_REFERENCE_CONFIDENCE
+
+            for target in _body_link_target_values(segment, repo=ref.repo):
+                if target.key == ref.key:
+                    continue
+                key = (target.key, rel)
+                if key in seen:
+                    continue
+                seen.add(key)
+                record: dict[str, Any] = {
+                    "from_thread_key": ref.key,
+                    "to_thread_key": target.key,
+                    "rel": rel,
+                    "source": "body",
+                    "confidence": confidence,
+                    "evidence": evidence,
+                }
+                if discovered_at is not None:
+                    record["discovered_at"] = discovered_at
+                records.append(record)
+    return records
+
+
+# Public aliases keep the parser discoverable for callers/tests without
+# coupling them to the storage-oriented implementation name.
+extract_body_links = body_link_records
+extract_body_thread_links = body_link_records
+parse_body_links = body_link_records
+body_thread_link_records = body_link_records
 
 
 def _link_timestamp(payload: dict[str, Any]) -> str:
@@ -1696,6 +1869,7 @@ def collect_event_records(
             "number": number,
             "kind": kind,
             "note": str(watched.get("note", "")),
+            "body": watched.get("body", ""),
         }
         refs.setdefault(key, ThreadRef(repo, number, kind))
 
@@ -1719,6 +1893,51 @@ def collect_event_records(
     metadata_seen: set[str] = set()
     metadata_links_seen: set[tuple[str, str]] = set()
     metadata_parent_refs: dict[str, ThreadRef] = {}
+    official_parent_by_child: dict[str, ThreadRef] = {}
+    for stored_link in get_session().db.thread_links():
+        if (
+            str(stored_link.get("rel", "")).strip().lower() == "parent"
+            and str(stored_link.get("source", "")).strip().lower() == "metadata"
+        ):
+            child_key = str(stored_link.get("from_thread_key", ""))
+            parent_key = str(stored_link.get("to_thread_key", ""))
+            if child_key and parent_key:
+                try:
+                    parent_repo, parent_number = parent_key.rsplit("#", 1)
+                    official_parent_by_child.setdefault(
+                        child_key,
+                        ThreadRef(parent_repo, int(parent_number), "issue"),
+                    )
+                except (ValueError, TypeError):
+                    continue
+
+    def append_body_links(
+        ref: ThreadRef,
+        body: Any,
+        *,
+        discovered_at: str | None = None,
+        cutoff: datetime | None = None,
+    ) -> None:
+        if not body:
+            return
+        for link in body_link_records(
+            ref,
+            str(body),
+            discovered_at=discovered_at,
+        ):
+            if cutoff is not None and not _link_is_since(link, cutoff):
+                continue
+            if link["rel"] == "inferred_parent":
+                official_parent = official_parent_by_child.get(ref.key)
+                if official_parent and official_parent.key != link["to_thread_key"]:
+                    warning = (
+                        f"{ref.key}: body Parent {link['to_thread_key']} conflicts with "
+                        f"metadata parent {official_parent.key}; metadata parent preferred"
+                    )
+                    if warning not in warnings:
+                        warnings.append(warning)
+            if thread_links is not None:
+                thread_links.append(link)
 
     def stage_thread_metadata(
         ref: ThreadRef,
@@ -1760,6 +1979,7 @@ def collect_event_records(
 
     def append_metadata_parent(child: ThreadRef, parent: ThreadRef) -> None:
         link_key = (child.key, parent.key)
+        official_parent_by_child[child.key] = parent
         if link_key not in metadata_links_seen:
             metadata_links_seen.add(link_key)
             if thread_links is not None:
@@ -1806,6 +2026,32 @@ def collect_event_records(
             # Parent-only metadata is the one case where a thread with no
             # parent of its own must still retain its title in the cache.
             stage_thread_metadata(ref, issue)
+        body = issue.get("body")
+        if body:
+            append_body_links(
+                ref,
+                body,
+                # Metadata payloads carry ``updated_at`` in normal GitHub
+                # responses.  Leave it unset for minimal fixtures; the DB
+                # normalizer supplies the observation timestamp without
+                # adding another collection-clock read.
+                discovered_at=(
+                    str(issue.get("updated_at"))
+                    if issue.get("updated_at")
+                    else None
+                ),
+            )
+
+    # A custom watch provider may already have a body on an entry.  The
+    # regular DB-backed watch list does not store one, but accepting it here
+    # keeps that optional input on the same low-cost parsing path.
+    for key, watched in watch_by_key.items():
+        if watched.get("body"):
+            append_body_links(
+                ThreadRef(str(watched["repo"]), int(watched["number"]), str(watched["kind"])),
+                watched["body"],
+                discovered_at=None,
+            )
 
     # Existing incremental rows with a populated title are already covered
     # by their collection watermark.  New and backfill rows go through REST
@@ -1906,6 +2152,14 @@ def collect_event_records(
                 for event in (comment_event_record(ref, item) for item in comments)
                 if event
             )
+            for comment in comments:
+                comment_timestamp = comment.get("created_at") or comment.get("updated_at")
+                append_body_links(
+                    ref,
+                    comment.get("body"),
+                    discovered_at=str(comment_timestamp) if comment_timestamp else None,
+                    cutoff=thread_cutoff,
+                )
         thread_events = [
             event for event in thread_events if event_is_since(event, thread_cutoff)
         ]
@@ -2123,7 +2377,12 @@ def format_list_markdown(
             related = assignment.related if assignment else tuple(s.related)
             if not group_anchor:
                 group_anchor = s.ref.key
-            lines.append(f"- **group anchor**: `{group_anchor}` ({group_role or 'anchor'})")
+            inferred = bool(assignment.is_inferred) if assignment else False
+            inferred_marker = " [inferred]" if inferred else ""
+            lines.append(
+                f"- **group anchor**: `{group_anchor}` ({group_role or 'anchor'})"
+                f"{inferred_marker}"
+            )
             if related:
                 lines.append(f"- **related**: {', '.join(f'`{key}`' for key in related)}")
         lines.append(f"- **updated**: {s.updated_at}")
@@ -2189,6 +2448,11 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "group_anchor": s.group_anchor or (s.ref.key if s.ref.number else None),
                 "group_role": s.group_role or ("anchor" if s.ref.number else None),
                 "related": s.related,
+                "inferred": bool(
+                    assignments.get(s.ref.key).is_inferred
+                    if s.ref.number and s.ref.key in assignments
+                    else False
+                ),
             })
         print(json.dumps({"meta": meta, "items": payload}, ensure_ascii=False, indent=2))
     else:
@@ -2327,7 +2591,14 @@ def format_daily_markdown(
             if event_day:
                 lines.append(f"### {event_day}")
             for anchor, anchor_events in by_anchor.items():
-                lines.append(f"#### Group anchor: `{anchor}`")
+                inferred = any(
+                    _assignment_for_key(
+                        _event_thread_key(event) or "", group_assignments
+                    ).is_inferred
+                    for event in anchor_events
+                )
+                marker = " [inferred]" if inferred else ""
+                lines.append(f"#### Group anchor: `{anchor}`{marker}")
                 for event in anchor_events:
                     lines.append(_daily_event_line(event, indent="  "))
                 related = sorted({
@@ -2408,6 +2679,7 @@ def format_drill_markdown(
     timeline: list[dict[str, Any]],
     *,
     assignment: WorkGroupAssignment | None = None,
+    links: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     lines = [f"## drill: {ref.key}", ""]
     lines.append(f"**{issue.get('title', '')}**")
@@ -2415,6 +2687,8 @@ def format_drill_markdown(
     lines.append(f"- url: {ref.web_url}")
     if assignment is not None:
         lines.append(f"- group anchor: `{assignment.group_anchor}` ({assignment.group_role})")
+        if assignment.is_inferred:
+            lines.append("- group relation: [inferred]")
         if assignment.related:
             lines.append(
                 f"- related: {', '.join(f'`{key}`' for key in assignment.related)}"
@@ -2425,6 +2699,21 @@ def format_drill_markdown(
     assignees = [a["login"] for a in issue.get("assignees", [])]
     if assignees:
         lines.append(f"- assignees: {', '.join(assignees)}")
+    evidence_links = [
+        link for link in (links or ())
+        if str(link.get("source", "")).strip().lower() == "body"
+        and link.get("evidence")
+    ]
+    if evidence_links:
+        lines.append("")
+        lines.append("### 推論リンク")
+        for link in evidence_links:
+            lines.append(
+                f"- **{link.get('rel', 'related')}** → `"
+                f"{link.get('to_thread_key', '?')}` "
+                f"(confidence={link.get('confidence', '')})"
+            )
+            lines.append(f"  evidence: {link['evidence']}")
     lines.append(f"- updated: {issue.get('updated_at')}")
     body = snippet(issue.get("body", ""), 400)
     if body:
@@ -2464,6 +2753,10 @@ def cmd_drill(args: argparse.Namespace) -> int:
     issue = fetch_issue_or_pr(ref)
     comments = fetch_comments(ref, args.comments)
     timeline = fetch_timeline(ref, per_page=max(30, args.comments * 2))
+    links = [
+        json_safe_value(link)
+        for link in get_session().load_thread_links(thread_key_value=ref.key)
+    ]
     assignments = _thread_group_assignments([ref])
     assignment = _assignment_for_key(ref.key, assignments)
     if not args.no_mark_seen:
@@ -2475,6 +2768,7 @@ def cmd_drill(args: argparse.Namespace) -> int:
             "issue": issue,
             "comments": comments,
             "timeline": timeline,
+            "links": links,
         }, ensure_ascii=False, indent=2))
     else:
         print(format_drill_markdown(
@@ -2483,6 +2777,7 @@ def cmd_drill(args: argparse.Namespace) -> int:
             comments,
             timeline,
             assignment=assignment,
+            links=links,
         ))
     return 0
 
@@ -2584,6 +2879,11 @@ def build_parser() -> argparse.ArgumentParser:
     lp.add_argument("--no-notifications", action="store_true", help="通知ソースを除外")
     lp.add_argument("--no-watch", action="store_true", help="watch リストを除外")
     lp.add_argument("--no-mine", action="store_true", help="自分の open PR/Issue を除外")
+    lp.add_argument(
+        "--related",
+        action="store_true",
+        help="保存済みの関連リンクと推論マーカーを表示（既定でも関連欄は表示）",
+    )
     lp.add_argument("--json", action="store_true")
     lp.set_defaults(func=cmd_list)
 

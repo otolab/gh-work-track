@@ -572,6 +572,115 @@ def test_watch_parent_graphql_discovery_persists_child_without_watching_it(
     assert len(graphql_calls) == 1
 
 
+def test_sync_body_parent_creates_cross_repo_link_without_discovery(
+    monkeypatch, tmp_path, capsys
+):
+    from gh_work_track import cli
+
+    db_path = tmp_path / "lance"
+    source = github_ops.ThreadRef("old-plaidev/karte-io-ops", 8814, "pr")
+    target = github_ops.ThreadRef("plaidev/karte-io-systems", 169457, "issue")
+    issue_calls: list[str] = []
+    timeline_calls: list[str] = []
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([source], []),
+    )
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+
+    def fetch_issue(ref):
+        issue_calls.append(ref.key)
+        return {
+            "title": "ops task",
+            "updated_at": "2026-09-17T10:00:00Z",
+            "body": f"Parent: {target.web_url}",
+        }
+
+    monkeypatch.setattr(github_ops, "fetch_issue_or_pr", fetch_issue)
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda ref, *args, **kwargs: timeline_calls.append(ref.key) or [],
+    )
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+
+    assert cli.main([
+        "--db", str(db_path), "sync", "--since", "365", "--json"
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    database = WorkTrackDB(str(db_path))
+    links = database.thread_links()
+    assert payload["thread_count"] == 1
+    assert issue_calls == [source.key]
+    assert timeline_calls == [source.key]
+    assert database.get_thread(target.repo, target.number) is None
+    assert {
+        (row["from_thread_key"], row["to_thread_key"], row["rel"], row["source"])
+        for row in links
+    } == {(source.key, target.key, "inferred_parent", "body")}
+    assert links[0]["evidence"] == f"Parent: {target.web_url}"
+
+
+def test_body_parent_conflict_warns_and_metadata_parent_wins(
+    monkeypatch, tmp_path, capsys
+):
+    from gh_work_track import cli
+
+    db_path = tmp_path / "lance"
+    child = github_ops.ThreadRef("owner/repo", 10, "pr")
+    metadata_parent = github_ops.ThreadRef("owner/repo", 20, "issue")
+    inferred_parent = github_ops.ThreadRef("owner/repo", 30, "issue")
+    issue_payloads = {
+        child.key: {
+            "title": "child",
+            "updated_at": "2026-09-17T10:00:00Z",
+            "parent_issue_url": metadata_parent.web_url,
+            "body": f"Parent: {inferred_parent.web_url}",
+        },
+        metadata_parent.key: {"title": "official parent"},
+    }
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([child], []),
+    )
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+    monkeypatch.setattr(github_ops, "fetch_sub_issues", lambda ref: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_issue_or_pr",
+        lambda ref: issue_payloads[ref.key],
+    )
+    monkeypatch.setattr(github_ops, "fetch_timeline", lambda *args, **kwargs: [])
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+
+    assert cli.main([
+        "--db", str(db_path), "sync", "--since", "365", "--json"
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    database = WorkTrackDB(str(db_path))
+    links = database.thread_links()
+
+    assert any("body Parent" in warning for warning in payload["warnings"])
+    assert {
+        (row["from_thread_key"], row["to_thread_key"], row["rel"])
+        for row in links
+    } == {
+        (child.key, metadata_parent.key, "parent"),
+        (child.key, inferred_parent.key, "inferred_parent"),
+    }
+    assignments = github_ops.resolve_work_groups(links)
+    assert assignments[child.key].group_anchor == metadata_parent.key
+
+
 def test_backfill_graphql_discovery_persists_child_and_anchor(
     monkeypatch, tmp_path, capsys
 ):

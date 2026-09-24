@@ -105,6 +105,14 @@ timeline collection なしで `threads` に登録します。親への自動 wat
 
 timeline / comments のページングコストは discovery 改善後の主要ボトルネックです（Issue #14 本文参照）。
 
+metadata fetch で得た Issue/PR body は常にキーワード行ベースで解析し、comments body
+は上記の条件で comments API を取得したスレッドだけ解析します。`Parent:` / `親:`、
+`refs:` / `Related:` / `関連:`、PR の `closes` / `fixes` と GitHub の full URL を
+`thread_links` の `source=body` として保存し、マッチ行の `evidence` を残します。
+body から見つけた別 repo の ThreadRef は link の端点になるだけで、discovery の union
+へは自動投入しません。公式 `parent_issue_url` と本文の Parent が食い違うときは
+warning を出し、WorkGroup では公式 metadata link を優先します。
+
 ## 失敗時ポリシー
 
 | ソース | 失敗時 | watermark |

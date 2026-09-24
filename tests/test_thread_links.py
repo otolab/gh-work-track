@@ -44,6 +44,62 @@ def test_cross_referenced_timeline_payload_extracts_source_issue():
     }]
 
 
+def test_body_parent_normalizes_cross_repo_reference_and_keeps_evidence():
+    ref = github_ops.ThreadRef("old-plaidev/karte-io-ops", 8814, "pr")
+    target = "https://github.com/plaidev/karte-io-systems/issues/169457"
+
+    links = github_ops.body_link_records(
+        ref,
+        f"Parent: {target}\nRelated: #42",
+    )
+
+    assert links == [
+        {
+            "from_thread_key": "old-plaidev/karte-io-ops#8814",
+            "to_thread_key": "plaidev/karte-io-systems#169457",
+            "rel": "inferred_parent",
+            "source": "body",
+            "confidence": 0.3,
+            "evidence": f"Parent: {target}",
+        },
+        {
+            "from_thread_key": "old-plaidev/karte-io-ops#8814",
+            "to_thread_key": "old-plaidev/karte-io-ops#42",
+            "rel": "inferred_ref",
+            "source": "body",
+            "confidence": 0.6,
+            "evidence": "Related: #42",
+        },
+    ]
+
+
+def test_body_parser_ignores_unrelated_and_code_fragment_numbers():
+    ref = github_ops.ThreadRef("owner/repo", 10, "pr")
+    body = """
+Unrelated issue #123 is mentioned in prose.
+
+```python
+refs = "#456"
+url = "https://github.com/owner/other/issues/789"
+```
+
+The literal `#999` is not a relationship.
+The literal `Parent: #1000` is not a relationship either.
+"""
+
+    assert github_ops.body_link_records(ref, body) == []
+
+
+def test_body_parser_only_accepts_closes_and_fixes_for_prs():
+    issue = github_ops.ThreadRef("owner/repo", 10, "issue")
+    pr = github_ops.ThreadRef("owner/repo", 11, "pr")
+
+    assert github_ops.body_link_records(issue, "fixes #12") == []
+    links = github_ops.body_link_records(pr, "closes #12")
+    assert links[0]["rel"] == "closes"
+    assert links[0]["to_thread_key"] == "owner/repo#12"
+
+
 def test_endpoint_bearing_connected_payload_extracts_blocks_direction():
     ref = github_ops.ThreadRef("owner/repo", 10, "issue")
     payload = {
@@ -136,6 +192,55 @@ def test_collect_event_records_can_collect_links_alongside_events(monkeypatch, t
 
     assert len(links) == 1
     assert links[0]["rel"] == "cross_ref"
+
+
+def test_collect_event_records_parses_body_of_fetched_comments(monkeypatch, tmp_path):
+    from gh_work_track.session import open_session
+
+    open_session(str(tmp_path / "lance"))
+    ref = github_ops.ThreadRef("owner/repo", 10, "pr")
+    target = "https://github.com/other/repo/issues/20"
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([ref], []),
+    )
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+    monkeypatch.setattr(github_ops, "fetch_issue_or_pr", lambda ref_arg: {"title": "PR"})
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_timeline",
+        lambda *args, **kwargs: [{
+            "id": 1,
+            "event": "commented",
+            "created_at": "2026-09-17T10:00:00Z",
+            "user": {"login": "alice"},
+            "body": "activity",
+        }],
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_all_comments",
+        lambda ref_arg: [{
+            "id": 2,
+            "created_at": "2026-09-17T10:01:00Z",
+            "user": {"login": "alice"},
+            "body": f"Related: {target}",
+        }],
+    )
+    links: list[dict] = []
+
+    github_ops.collect_event_records(
+        cutoff=datetime(2026, 9, 17, 9, tzinfo=timezone.utc),
+        thread_links=links,
+    )
+
+    assert len(links) == 1
+    assert links[0]["to_thread_key"] == "other/repo#20"
+    assert links[0]["rel"] == "inferred_ref"
+    assert links[0]["evidence"] == f"Related: {target}"
 
 
 def test_grouped_daily_is_nested_but_default_daily_stays_flat():
@@ -285,3 +390,86 @@ def test_daily_group_anchor_reads_stored_links_and_adds_json_anchor(tmp_path, ca
     ]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["events"]["2026-09-17"][0]["group_anchor"] == "owner/repo#10"
+
+
+def test_inferred_daily_group_and_drill_show_inference_and_evidence():
+    child = "owner/repo#11"
+    parent = "other/repo#10"
+    assignments = github_ops.resolve_work_groups([{
+        "from_thread_key": child,
+        "to_thread_key": parent,
+        "rel": "inferred_parent",
+        "source": "body",
+    }])
+    events = [{
+        "date": "2026-09-17",
+        "repo": "owner/repo",
+        "number": 11,
+        "kind": "issue",
+        "event": "commented",
+        "actor": "alice",
+        "snippet": "progress",
+        "url": "https://github.com/owner/repo/issues/11",
+    }]
+
+    daily = github_ops.format_daily_markdown(
+        date(2026, 9, 17),
+        date(2026, 9, 17),
+        events,
+        group_assignments=assignments,
+    )
+    drill = github_ops.format_drill_markdown(
+        github_ops.ThreadRef("owner/repo", 11),
+        {"title": "child", "state": "open", "updated_at": ""},
+        [],
+        [],
+        assignment=assignments[child],
+        links=[{
+            "from_thread_key": child,
+            "to_thread_key": parent,
+            "rel": "inferred_parent",
+            "source": "body",
+            "confidence": 0.3,
+            "evidence": "Parent: https://github.com/other/repo/issues/10",
+        }],
+    )
+
+    assert "#### Group anchor: `other/repo#10` [inferred]" in daily
+    assert "evidence: Parent: https://github.com/other/repo/issues/10" in drill
+
+
+def test_drill_json_serializes_stored_body_link_timestamp(monkeypatch, tmp_path, capsys):
+    from gh_work_track import cli
+    from gh_work_track.db import WorkTrackDB
+
+    db_path = tmp_path / "lance"
+    database = WorkTrackDB(str(db_path))
+    database.init_tables()
+    database.upsert_thread_links([{
+        "from_thread_key": "owner/repo#10",
+        "to_thread_key": "other/repo#20",
+        "rel": "inferred_parent",
+        "source": "body",
+        "confidence": 0.3,
+        "evidence": "Parent: https://github.com/other/repo/issues/20",
+        "discovered_at": "2026-09-17T10:00:00Z",
+    }])
+
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_issue_or_pr",
+        lambda ref: {"title": "child", "state": "open", "updated_at": ""},
+    )
+    monkeypatch.setattr(github_ops, "fetch_comments", lambda ref, limit: [])
+    monkeypatch.setattr(github_ops, "fetch_timeline", lambda ref, **kwargs: [])
+
+    assert cli.main([
+        "--db", str(db_path),
+        "drill", "owner/repo#10",
+        "--no-mark-seen",
+        "--json",
+    ]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["links"][0]["evidence"].startswith("Parent:")
+    assert isinstance(payload["links"][0]["discovered_at"], str)

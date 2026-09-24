@@ -82,6 +82,7 @@ class WorkTrackDB:
                 if "already exists" not in str(exc):
                     raise
         self._ensure_sync_runs_schema()
+        self._ensure_thread_links_schema()
         self._ensure_indexes()
 
     def _ensure_sync_runs_schema(self) -> None:
@@ -110,6 +111,28 @@ class WorkTrackDB:
             defaults["error"] = ""
         if defaults and not table.search().to_pandas().empty:
             table.update(where="run_id IS NOT NULL", values=defaults)
+
+    def _ensure_thread_links_schema(self) -> None:
+        """Add link evidence to databases created before Phase 3.
+
+        ``thread_links`` originally stored only the edge metadata.  Body
+        inference needs to retain the matched source line so a user can
+        audit a low-confidence edge from ``drill``.  LanceDB tables are
+        persistent, so update old tables in place when the session is
+        writable; a read-only session can still read the old rows because
+        callers treat the field as optional.
+        """
+        table = self._get_table(THREAD_LINKS_TABLE)
+        expected = thread_links_schema()
+        existing = set(table.schema.names)
+        missing = [field for field in expected if field.name not in existing]
+        if not missing or self.read_only:
+            return
+        table.add_columns(missing)
+        if "evidence" in {field.name for field in missing}:
+            rows = table.search().to_pandas()
+            if not rows.empty:
+                table.update(where="from_thread_key IS NOT NULL", values={"evidence": ""})
 
     def _get_table(self, name: str):
         if name not in self._tables:
@@ -376,6 +399,7 @@ class WorkTrackDB:
             "rel": str(record.get("rel", "")),
             "source": str(record.get("source", "")),
             "confidence": float(record.get("confidence", 1.0)),
+            "evidence": str(record.get("evidence") or ""),
             "discovered_at": discovered_at,
         }
 

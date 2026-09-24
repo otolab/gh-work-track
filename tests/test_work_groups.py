@@ -47,6 +47,20 @@ def test_cross_reference_does_not_merge_groups():
     assert result[first].related == [second]
 
 
+def test_inferred_ref_cycle_keeps_both_edges_without_merging_groups():
+    first = "owner/repo#10"
+    second = "owner/repo#20"
+    result = resolve_work_groups([
+        link(first, second, "inferred_ref"),
+        link(second, first, "inferred_ref"),
+    ])
+
+    assert result[first].group_anchor == first
+    assert result[second].group_anchor == second
+    assert result[first].related == [second]
+    assert result[second].related == [first]
+
+
 def test_parent_cycle_uses_watch_kind_number_tie_break_not_union_find():
     a = "owner/repo#10"
     b = "owner/repo#20"
