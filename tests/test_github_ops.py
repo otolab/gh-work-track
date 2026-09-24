@@ -352,6 +352,89 @@ def test_collect_event_records_unions_events_and_deduplicates_search_refs(
     assert thread_count == 2
 
 
+def test_metadata_parent_discovery_registers_anchor_without_parent_timeline(
+    monkeypatch, tmp_path, capsys
+):
+    from gh_work_track import cli
+
+    db_path = tmp_path / "lance"
+    child_a = github_ops.ThreadRef("plaidev/karte-io-systems", 169460)
+    child_b = github_ops.ThreadRef("plaidev/karte-io-systems", 169462)
+    parent = github_ops.ThreadRef("plaidev/karte-io-systems", 169457)
+    parent_url = "https://api.github.com/repos/plaidev/karte-io-systems/issues/169457"
+    issue_payloads = {
+        child_a.key: {"title": "child A", "parent_issue_url": parent_url},
+        child_b.key: {"title": "child B", "parent_issue_url": parent_url},
+        parent.key: {"title": "MAILGUN epic"},
+    }
+    issue_calls: list[str] = []
+    timeline_calls: list[str] = []
+    graphql_calls: list[str] = []
+
+    monkeypatch.setattr(github_ops, "fetch_notifications", lambda **kwargs: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_search_threads",
+        lambda cutoff_date, **kwargs: ([child_a, child_b], []),
+    )
+    monkeypatch.setattr(github_ops, "fetch_user_event_threads", lambda cutoff: ([], []))
+    monkeypatch.setattr(github_ops, "load_watch", lambda: [])
+    monkeypatch.setattr(
+        github_ops,
+        "fetch_sub_issues",
+        lambda ref: graphql_calls.append(ref.key) or [],
+    )
+
+    def fetch_issue(ref):
+        issue_calls.append(ref.key)
+        return issue_payloads[ref.key]
+
+    monkeypatch.setattr(github_ops, "fetch_issue_or_pr", fetch_issue)
+
+    def fetch_timeline(ref, *args, **kwargs):
+        timeline_calls.append(ref.key)
+        return [{
+            "id": ref.number,
+            "event": "commented",
+            "created_at": "2026-09-17T10:00:00Z",
+            "user": {"login": "alice"},
+            "body": ref.key,
+        }]
+
+    monkeypatch.setattr(github_ops, "fetch_timeline", fetch_timeline)
+    monkeypatch.setattr(github_ops, "fetch_all_comments", lambda ref: [])
+
+    assert cli.main(["--db", str(db_path), "sync", "--json"]) == 0
+    capsys.readouterr()
+
+    database = WorkTrackDB(str(db_path))
+    links = database.thread_links()
+    assert {
+        (row["from_thread_key"], row["to_thread_key"], row["rel"], row["source"])
+        for row in links
+    } == {
+        (child_a.key, parent.key, "parent", "metadata"),
+        (child_b.key, parent.key, "parent", "metadata"),
+    }
+    parent_row = database.get_thread(parent.repo, parent.number)
+    assert parent_row is not None
+    assert parent_row["title"] == "MAILGUN epic"
+    assert parent_row["last_synced_at"] == ""
+    assert database.list_watched_threads() == []
+    assert issue_calls == [child_a.key, child_b.key, parent.key]
+    assert timeline_calls == [child_a.key, child_b.key]
+    assert graphql_calls == []
+
+    assert cli.main([
+        "--db", str(db_path),
+        "daily",
+        "--date", "2026-09-17",
+        "--group", "epic",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert f"#### Group anchor: `{parent.key}`" in output
+
+
 def test_effective_thread_cutoff_uses_global_thread_and_db_floors(tmp_path):
     db_path = tmp_path / "lance"
     database = WorkTrackDB(str(db_path))

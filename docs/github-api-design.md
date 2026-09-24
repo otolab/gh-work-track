@@ -95,6 +95,13 @@ Events は **完全な activity history ではない** ため、主軸の search
 |---|---|---|
 | `repos/{repo}/issues/{n}/timeline` | レビュー・状態変更等 | 返却順非保証 → 順序不明時は全ページ取得 |
 | `repos/{repo}/issues/{n}/comments` | コメント本文 | timeline に recent activity がなければ省略可 |
+| `repos/{repo}/issues/{n}` | `parent_issue_url` と最小 thread metadata | incremental は新規/未充足 thread、backfill は再取得 |
+| GraphQL `Issue.subIssues` | watch 親・backfill の子 discovery 補完 | 通常の child metadata lookup では呼ばない |
+
+REST metadata で子の `parent_issue_url` が見つかった場合は、子 → 親の
+`thread_links`（`rel=parent`, `source=metadata`, high confidence）を保存し、親を
+timeline collection なしで `threads` に登録します。親への自動 watch は行いません。
+同一親に複数の子がある場合も親 metadata fetch は一度だけです。
 
 timeline / comments のページングコストは discovery 改善後の主要ボトルネックです（Issue #14 本文参照）。
 

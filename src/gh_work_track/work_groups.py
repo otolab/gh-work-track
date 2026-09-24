@@ -3,7 +3,7 @@
 The link table is deliberately richer than a grouping table.  In particular,
 ``cross_ref`` and dependency links are useful context but do not make their
 endpoints members of the same work group.  Only ``parent`` links participate
-in anchor resolution in Phase 1.
+in anchor resolution; metadata-derived parents have the highest priority.
 
 Parent links use the direction ``child -> parent``.  A parent endpoint is
 included in the result even when it has no event of its own, which lets the
@@ -90,12 +90,14 @@ def _anchor_sort_key(
     *,
     watched: set[str],
     kinds: Mapping[str, str],
-) -> tuple[int, int, int, str]:
-    # A watched thread is the strongest user signal.  For otherwise equal
-    # candidates, prefer issues to PRs and then the stable numeric ref.
+    metadata_parents: set[str] | None = None,
+) -> tuple[int, int, int, int, str]:
+    # A metadata-discovered parent is the strongest structural signal.  For
+    # otherwise equal candidates, retain the Phase 1 watch/kind/number order.
     kind = str(kinds.get(key, "issue")).lower()
     kind_rank = 0 if kind in {"issue", "epic"} else 1 if kind in {"pr", "pull_request"} else 2
     return (
+        0 if key in (metadata_parents or set()) else 1,
         0 if key in watched else 1,
         kind_rank,
         _number_for_key(key),
@@ -114,8 +116,10 @@ def _normalise_inputs(
     set[str],
     dict[str, str],
     set[str],
+    set[str],
 ]:
     parents: dict[str, set[str]] = {}
+    metadata_parents: set[str] = set()
     related: dict[str, set[str]] = {}
     nodes: set[str] = set()
     watched, kinds = _watch_info(watch)
@@ -134,6 +138,8 @@ def _normalise_inputs(
         rel = str(_value(link, "rel", "")).strip().lower()
         if rel == "parent":
             parents.setdefault(from_key, set()).add(to_key)
+            if str(_value(link, "source", "")).strip().lower() == "metadata":
+                metadata_parents.add(to_key)
 
     for item in thread_keys or ():
         key = _thread_key(item)
@@ -143,7 +149,7 @@ def _normalise_inputs(
             if kind:
                 kinds[key] = str(kind)
 
-    return parents, related, nodes, kinds, watched
+    return parents, related, nodes, kinds, watched, metadata_parents
 
 
 def resolve_work_groups(
@@ -152,6 +158,7 @@ def resolve_work_groups(
     watch: Iterable[Any] | None = None,
     thread_keys: Iterable[Any] | None = None,
     thread_kinds: Mapping[str, str] | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[str, WorkGroupAssignment]:
     """Resolve ``thread_key -> (anchor, role, related)`` assignments.
 
@@ -159,11 +166,13 @@ def resolve_work_groups(
     creates an undirected connected component, so a cross-reference or a
     dependency cannot accidentally merge unrelated work.  If a parent path
     enters a cycle, the cycle members are reduced to one deterministic anchor
-    using the watch/kind/number tie-break order documented by
-    :func:`_anchor_sort_key`.
+    using the metadata-parent priority followed by the watch/kind/number
+    tie-break order documented by :func:`_anchor_sort_key`.  If ``warnings``
+    is supplied, every distinct parent cycle is reported before its
+    deterministic tie-break is applied.
     """
 
-    parents, related, nodes, kinds, watched = _normalise_inputs(
+    parents, related, nodes, kinds, watched, metadata_parents = _normalise_inputs(
         links, thread_keys, watch, thread_kinds
     )
     assignments: dict[str, WorkGroupAssignment] = {}
@@ -183,10 +192,17 @@ def resolve_work_groups(
                 break
             if current in positions:
                 cycle = set(path[positions[current] :])
+                cycle_path = path[positions[current] :] + [current]
+                warning = "parent cycle detected: " + " -> ".join(cycle_path)
+                if warnings is not None and warning not in warnings:
+                    warnings.append(warning)
                 anchor = min(
                     cycle,
                     key=lambda key: _anchor_sort_key(
-                        key, watched=watched, kinds=kinds
+                        key,
+                        watched=watched,
+                        kinds=kinds,
+                        metadata_parents=metadata_parents,
                     ),
                 )
                 for member in cycle:
@@ -201,7 +217,14 @@ def resolve_work_groups(
             current = min(
                 candidates,
                 key=lambda key: _anchor_sort_key(
-                    key, watched=watched, kinds=kinds
+                    key,
+                    watched=watched,
+                    kinds=kinds,
+                    metadata_parents=(
+                        {key}
+                        if key in metadata_parents
+                        else set()
+                    ),
                 ),
             )
         for member in reversed(path):
@@ -235,6 +258,7 @@ def resolve_groups(
     watch: Iterable[Any] | None = None,
     thread_keys: Iterable[Any] | None = None,
     thread_kinds: Mapping[str, str] | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[str, WorkGroupAssignment]:
     """Compatibility alias with a shorter name for library callers."""
 
@@ -243,6 +267,7 @@ def resolve_groups(
         watch=watch,
         thread_keys=thread_keys,
         thread_kinds=thread_kinds,
+        warnings=warnings,
     )
 
 

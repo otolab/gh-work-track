@@ -1,6 +1,6 @@
 # アーキテクチャ
 
-gh-work-track は GitHub 上の Issue/PR 活動を **ThreadRef**（`repo` + `number` + `kind`）単位で発見し、各スレッドの timeline / comments からイベントを取り込み、LanceDB に upsert する CLI です。
+gh-work-track は GitHub 上の Issue/PR 活動を **ThreadRef**（`repo` + `number` + `kind`）単位で発見し、Issue metadata と各スレッドの timeline / comments からイベント・スレッド間リンクを取り込み、LanceDB に upsert する CLI です。
 
 ## データフロー
 
@@ -13,6 +13,8 @@ flowchart TB
     E[Events API 補完]
   end
   subgraph collect [Collection — イベント取得]
+    M[Issue metadata REST]
+    G[限定的な GraphQL subIssues]
     T[timeline API]
     C[comments API]
   end
@@ -25,6 +27,14 @@ flowchart TB
   E --> Union
   Union --> T
   Union --> C
+  Union --> M
+  W --> G
+  Union --> G
+  M --> Threads[親/子 thread metadata]
+  M --> Links[metadata parent link]
+  G --> Links
+  G --> Union
+  Threads --> L
   T --> Dedupe[dedup_key で統合]
   C --> Dedupe
   Dedupe --> L
@@ -37,7 +47,7 @@ flowchart TB
 GitHub には「ユーザーが関与した全スレッドを期間指定で一覧する」単一 API がありません。そのため:
 
 1. **Discovery** — 複数経路で `ThreadRef` を union する（詳細は [github-api-design.md](github-api-design.md)）
-2. **Collection** — 各スレッドについて timeline / comments をページング取得し、`events` テーブル用レコードに変換する
+2. **Collection** — Issue metadata から公式の親子関係を取り込み、各収集対象スレッドについて timeline / comments をページング取得し、`events` テーブル用レコードに変換する
 
 Discovery で拾ったスレッド数が増えると、Collection の API 呼び出しも増えます。incremental sync と per-thread cutoff（README 参照）で Collection コストを抑えます。
 
@@ -54,7 +64,7 @@ Discovery で拾ったスレッド数が増えると、Collection の API 呼び
 
 | モジュール | 役割 |
 |---|---|
-| `github_ops.py` | `gh` / `gh api` 呼び出し、discovery、collection、CLI コマンド |
+| `github_ops.py` | `gh` / `gh api` 呼び出し、discovery、metadata/collection、CLI コマンド |
 | `config.py` | `mine_repos` / `search_orgs` / sync 設定 |
 | `db.py` | LanceDB、`merge_insert`、`sync_runs` watermark、thread links |
 | `work_groups.py` | 有向 parent 辺から WorkGroup anchor を解決 |
@@ -71,11 +81,13 @@ key = "owner/name#42"   # union / dedupe に使用
 
 ## Thread links と WorkGroup
 
-timeline の `cross-referenced` と、端点を含む enriched payload の
-`connected` は、イベントとは別に `thread_links` へ保存します。link の向きは
-`from_thread_key` → `to_thread_key`、`rel` は `cross_ref` / `blocks` /
-`blocked_by` など、`source` は現在のところ `timeline` です。同じ端点・関係・
-source の行は upsert され、再同期しても重複しません。
+REST Issue metadata の `parent_issue_url`、timeline の `cross-referenced` と、
+端点を含む enriched payload の `connected` は、イベントとは別に
+`thread_links` へ保存します。metadata の親 link は子 → 親、
+`source=metadata`、`confidence=1.0`（high）です。link の向きは
+`from_thread_key` → `to_thread_key`、`rel` は `parent` / `cross_ref` /
+`blocks` / `blocked_by` などです。同じ端点・関係・source の行は upsert され、
+再同期しても重複しません。
 
 ただし GitHub REST の [documented `connected` event payload](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types#connected)
 には、イベント自身の `id` / `url` や commit 情報はありますが、接続先 Issue/PR
@@ -85,14 +97,16 @@ source の行は upsert され、再同期しても重複しません。
 の抽出器で扱えますが、REST collector が生成するものではありません。
 
 WorkGroup の anchor 解決に使うのは意味が明確な `parent` 辺だけです。
-Phase 1 の parent 辺は子 → 親の向きで、親にイベントがなくても anchor として
-表示できます。Phase 1 では `parent_issue_url` を自動で parent 辺へ昇格しません。
-したがって MAILGUN のようにそのフィールドが `source.issue` に存在しても、実 sync
-で自動ロールアップは発生せず、Phase 2 まで待つ必要があります。手動で保存した
-parent 辺は通常どおり解決できます。`cross_ref` や依存辺は `related` として表示
-しますが、同じグループにはしません。parent 辺が循環する場合は watch 登録、種別、
-番号の順で deterministic に anchor を選びます。無向 connected components /
-union-find は使いません。
+parent 辺は子 → 親の向きで、親にイベントがなくても anchor として表示できます。
+anchor は metadata 由来の parent、watch 登録、種別・番号の順で優先します。
+`cross_ref` や依存辺は `related` として表示しますが、同じグループにはしません。
+parent 辺が循環する場合はデータ不整合として warning を出し、その後に同じ優先順で
+deterministic に anchor を選びます。無向 connected components / union-find は使いません。
+
+子の metadata から発見した親は `threads` に最小 metadata とともに登録しますが、
+watch リストには自動追加しません。親自身の timeline / comments は同じ同期の対象に
+含めず、必要な metadata REST fetch だけを行います。GraphQL `subIssues` は明示的な
+watch 親と backfill の discovery 補完に限定します。
 
 通常の `daily` は従来どおりフラットです。`daily --group anchor`（`epic` も可）
 だけが日次イベントを anchor 配下へネストし、JSON では各イベントに
