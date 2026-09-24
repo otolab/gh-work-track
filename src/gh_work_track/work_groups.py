@@ -2,8 +2,10 @@
 
 The link table is deliberately richer than a grouping table.  In particular,
 ``cross_ref`` and dependency links are useful context but do not make their
-endpoints members of the same work group.  Only ``parent`` links participate
-in anchor resolution; metadata-derived parents have the highest priority.
+endpoints members of the same work group.  Official ``parent`` links
+participate in anchor resolution first; ``inferred_parent`` is only a
+fallback when no official parent exists, and metadata-derived parents have
+the highest priority.
 
 Parent links use the direction ``child -> parent``.  A parent endpoint is
 included in the result even when it has no event of its own, which lets the
@@ -27,12 +29,19 @@ class WorkGroupAssignment(NamedTuple):
     group_anchor: str
     group_role: str
     related: list[str]
+    is_inferred: bool = False
+
+    @property
+    def inferred(self) -> bool:
+        """Compatibility/readability alias for presentation callers."""
+        return self.is_inferred
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "group_anchor": self.group_anchor,
             "group_role": self.group_role,
             "related": list(self.related),
+            "inferred": self.is_inferred,
         }
 
 
@@ -113,12 +122,14 @@ def _normalise_inputs(
 ) -> tuple[
     dict[str, set[str]],
     dict[str, set[str]],
+    dict[str, set[str]],
     set[str],
     dict[str, str],
     set[str],
     set[str],
 ]:
     parents: dict[str, set[str]] = {}
+    inferred_parents: dict[str, set[str]] = {}
     metadata_parents: set[str] = set()
     related: dict[str, set[str]] = {}
     nodes: set[str] = set()
@@ -140,6 +151,11 @@ def _normalise_inputs(
             parents.setdefault(from_key, set()).add(to_key)
             if str(_value(link, "source", "")).strip().lower() == "metadata":
                 metadata_parents.add(to_key)
+        elif rel == "inferred_parent":
+            # Body inference is a fallback candidate only.  It must never
+            # replace an official metadata/timeline parent for the same
+            # child, and inferred_ref/closes remain related context only.
+            inferred_parents.setdefault(from_key, set()).add(to_key)
 
     for item in thread_keys or ():
         key = _thread_key(item)
@@ -149,7 +165,7 @@ def _normalise_inputs(
             if kind:
                 kinds[key] = str(kind)
 
-    return parents, related, nodes, kinds, watched, metadata_parents
+    return parents, inferred_parents, related, nodes, kinds, watched, metadata_parents
 
 
 def resolve_work_groups(
@@ -172,11 +188,20 @@ def resolve_work_groups(
     deterministic tie-break is applied.
     """
 
-    parents, related, nodes, kinds, watched, metadata_parents = _normalise_inputs(
+    (
+        parents,
+        inferred_parents,
+        related,
+        nodes,
+        kinds,
+        watched,
+        metadata_parents,
+    ) = _normalise_inputs(
         links, thread_keys, watch, thread_kinds
     )
     assignments: dict[str, WorkGroupAssignment] = {}
     anchor_cache: dict[str, str] = {}
+    inferred_cache: dict[str, bool] = {}
 
     def resolve_anchor(start: str) -> str:
         cached = anchor_cache.get(start)
@@ -184,11 +209,13 @@ def resolve_work_groups(
             return cached
         path: list[str] = []
         positions: dict[str, int] = {}
+        used_inferred = False
         current = start
         while True:
             cached = anchor_cache.get(current)
             if cached:
                 anchor = cached
+                used_inferred = used_inferred or inferred_cache.get(current, False)
                 break
             if current in positions:
                 cycle = set(path[positions[current] :])
@@ -207,13 +234,17 @@ def resolve_work_groups(
                 )
                 for member in cycle:
                     anchor_cache[member] = anchor
+                    inferred_cache[member] = used_inferred
                 break
             positions[current] = len(path)
             path.append(current)
-            candidates = parents.get(current, set())
+            official_candidates = parents.get(current, set())
+            candidates = official_candidates or inferred_parents.get(current, set())
             if not candidates:
                 anchor = current
                 break
+            if not official_candidates:
+                used_inferred = True
             current = min(
                 candidates,
                 key=lambda key: _anchor_sort_key(
@@ -229,13 +260,19 @@ def resolve_work_groups(
             )
         for member in reversed(path):
             anchor_cache.setdefault(member, anchor)
+            inferred_cache.setdefault(member, used_inferred)
         return anchor
 
     for node in sorted(nodes):
         anchor = resolve_anchor(node)
         role = "anchor" if node == anchor else "child"
         neighbours = sorted(related.get(node, set()))
-        assignments[node] = WorkGroupAssignment(anchor, role, neighbours)
+        assignments[node] = WorkGroupAssignment(
+            anchor,
+            role,
+            neighbours,
+            inferred_cache.get(node, False),
+        )
 
     # Keep the resolver total even if an unusual caller supplies a link whose
     # endpoint was filtered while iterating.  This also makes the public
@@ -247,6 +284,7 @@ def resolve_work_groups(
                 anchor,
                 "anchor" if node == anchor else "child",
                 sorted(related.get(node, set())),
+                inferred_cache.get(node, False),
             ),
         )
     return assignments

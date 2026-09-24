@@ -102,8 +102,13 @@ sync では `blocks` / `blocked_by` を推測せず、端点不明の最近の�
 REST Issue metadata の `parent_issue_url` は Phase 2 で `parent` 辺へ昇格します。
 そのため MAILGUN のように子 discovery だけで親を発見できるスレッドは、親自身に
 イベントがなくても `daily --group epic` の anchor 配下へ表示されます。発見した親は
-自動で watch には追加されません。`cross_ref` だけから親子関係を推測する処理は
-Phase 3 まで行いません。
+自動で watch には追加されません。Phase 3 では Issue/PR metadata body と、recent
+activity により取得した comments body の `Parent:` / `refs:` / `Related:` / `関連:` /
+PR の `closes`・`fixes` 行を低信頼の `thread_links`（`source=body`）として保存します。
+本文の full URL は `owner/repo#number` に正規化し、マッチ行の `evidence` を `drill`
+で表示します。推論リンクは discovery の参照先を自動追加せず、公式
+`parent_issue_url` がある場合は metadata を WorkGroup の anchor として優先します。
+`daily --group epic` と `list` では推論だけで決まったグループに `[inferred]` を付けます。
 
 ### 修復・初回: `sync --since N`
 

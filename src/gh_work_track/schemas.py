@@ -56,6 +56,7 @@ def thread_links_schema() -> pa.Schema:
             pa.field("rel", pa.string()),
             pa.field("source", pa.string()),
             pa.field("confidence", pa.float64()),
+            pa.field("evidence", pa.string()),
             pa.field("discovered_at", pa.timestamp("ms")),
         ]
     )

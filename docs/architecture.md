@@ -67,7 +67,7 @@ Discovery で拾ったスレッド数が増えると、Collection の API 呼び
 | `github_ops.py` | `gh` / `gh api` 呼び出し、discovery、metadata/collection、CLI コマンド |
 | `config.py` | `mine_repos` / `search_orgs` / sync 設定 |
 | `db.py` | LanceDB、`merge_insert`、`sync_runs` watermark、thread links |
-| `work_groups.py` | 有向 parent 辺から WorkGroup anchor を解決 |
+| `work_groups.py` | 有向 parent 辺（推論 parent は fallback）から WorkGroup anchor を解決 |
 | `cli.py` | 引数と設定の解決 |
 
 ## ThreadRef
@@ -89,6 +89,15 @@ REST Issue metadata の `parent_issue_url`、timeline の `cross-referenced` と
 `blocks` / `blocked_by` などです。同じ端点・関係・source の行は upsert され、
 再同期しても重複しません。
 
+Issue/PR metadata の body と、timeline に recent activity があり取得した
+comments の body からは、キーワード行に限定して低信頼の link を推論します。
+`Parent:` / `親:` は `inferred_parent`（confidence 0.3）、`refs:` /
+`Related:` / `関連:` は `inferred_ref`（0.6）、PR の `closes` / `fixes` は
+`closes`（0.6）として `source=body` と、マッチした行の `evidence` を保存します。
+bare `#N` はキーワード行以外では参照せず、コードフェンス・インデントされた
+コードも除外します。本文 URL は `owner/repo#number` に正規化しますが、参照先を
+discovery や timeline collection へ自動追加しません。
+
 ただし GitHub REST の [documented `connected` event payload](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types#connected)
 には、イベント自身の `id` / `url` や commit 情報はありますが、接続先 Issue/PR
 の endpoint はありません。Phase 1 は追加 API を呼ばないため、通常の REST sync
@@ -96,10 +105,15 @@ REST Issue metadata の `parent_issue_url`、timeline の `cross-referenced` と
 最近のイベントは warning に記録されます。端点を含む別経路の payload はライブラリ
 の抽出器で扱えますが、REST collector が生成するものではありません。
 
-WorkGroup の anchor 解決に使うのは意味が明確な `parent` 辺だけです。
+WorkGroup の anchor 解決に使うのは意味が明確な `parent` 辺を優先し、公式 parent
+が無い場合だけ `inferred_parent` を候補にします。`inferred_ref` / `closes` は
+related context として保持するだけで、無向 connected component を作りません。
 parent 辺は子 → 親の向きで、親にイベントがなくても anchor として表示できます。
 anchor は metadata 由来の parent、watch 登録、種別・番号の順で優先します。
 `cross_ref` や依存辺は `related` として表示しますが、同じグループにはしません。
+推論だけで決まった group は `daily --group epic` / `list` で `[inferred]` を付け、
+`drill` では body の evidence を表示します。公式 `parent_issue_url` と本文の
+`Parent:` が矛盾する場合は warning を出し、metadata の parent を優先します。
 parent 辺が循環する場合はデータ不整合として warning を出し、その後に同じ優先順で
 deterministic に anchor を選びます。無向 connected components / union-find は使いません。
 
