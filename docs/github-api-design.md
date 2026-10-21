@@ -11,6 +11,18 @@ gh-work-track が GitHub API をどう使い、制限にどう対応するかを
 
 「ユーザー行動の一覧」そのものが目的ではなく、**daily / drill で引けるイベント列**を安定して作ることが目的です。
 
+## API 呼び出しを抑える日常運用
+
+`sync` は notifications / search による discovery の後、対象スレッドごとに timeline、必要に応じて comments と metadata を取得します。対象スレッドが多い run は API 呼び出しがまとまって発生するため、同期と調査を次のように分けます。
+
+- 1 セッションで `sync` は 1 回に留める。過去期間の確認だけを理由に再 sync / backfill しない。
+- `sync` 後の `list` は追加の通知・検索 API を呼ぶため、必要がなければ実行しない。
+- 保存済みイベントの確認は `daily` を使う。`daily --date YYYY-MM-DD` と `daily --since N` は LanceDB のみを読み、GitHub API を呼ばない。`--group anchor` / `--group epic` も保存済み thread links から解決する。
+- 過去期間や日別件数の調査は LanceDB の read-only query を優先し、`daily` は必要な日だけ実行する。
+- 恒久保存する日報は同期後の `daily` 出力からローカル export する。export のために追加取得を行わない。
+
+見積もりや追加の待ち時間を入れる場合、呼び出しをどの程度抑えるべきかを裏付ける観測と利用実態がまだ不足しています。適切な抑制水準、同期にかかる時間、対象量、他の `gh` 作業への影響を観測してから、[Issue #24](https://github.com/otolab/gh-work-track/issues/24) で見積もりや proactive throttling / cooldown を検討します。現状は既存 retry / backoff とこの運用指針で対応します。
+
 ## Discovery 経路
 
 `collect_event_records()`（`github_ops.py`）が次を `ThreadRef.key` で union します。

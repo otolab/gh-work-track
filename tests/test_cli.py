@@ -90,6 +90,22 @@ def test_sync_help_explains_incremental_and_backfill_modes(capsys):
         assert "前回成功 sync 以降の incremental" in output
 
 
+def test_daily_help_points_to_saved_db_only_path(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--help"])
+
+    assert exc_info.value.code == 0
+    assert "LanceDB のみ・GitHub API 不使用" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["daily", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "GitHub API は呼び出しません" in output
+    assert "daily --date 2026-09-15 --group epic" in output
+
+
 def test_sync_since_uses_backfill_without_reading_watermark(monkeypatch, tmp_path):
     db_path = tmp_path / "lance"
     collected = {}
