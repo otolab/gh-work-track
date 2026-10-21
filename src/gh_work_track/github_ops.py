@@ -2576,7 +2576,11 @@ def format_daily_markdown(
         lines.extend(f"- {warning}" for warning in warnings)
         lines.append("")
     if not events:
-        lines.append("_該当なし（先に `sync --since N` を実行してください）_")
+        lines.append(
+            "_該当なし（対象日が未同期の可能性があります。まず既存のLanceDBにある"
+            "データを確認してください。追加取得を検討する場合は、必要性と影響範囲を"
+            "確認してから判断してください）_"
+        )
         return "\n".join(lines)
 
     if group_assignments is not None:
