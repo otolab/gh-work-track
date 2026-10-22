@@ -92,10 +92,12 @@ incremental sync では、前回成功 run の取得開始時刻を global cutof
 
 ### rate limit を避ける運用
 
-`sync` は通知・検索・スレッドごとの timeline / comments など複数の GitHub API 経路を使い、対象スレッドが多いと完了まで時間がかかります。同期直後の追加取得が同じ `gh` の利用枠を消費し、他の作業にも影響することがあるため、次の運用にしてください。
+`sync` は通知・検索・スレッドごとの timeline / comments など複数の GitHub API 経路を使い、対象スレッドが多いと完了まで時間がかかります。手元に保存された run では、349 スレッドの incremental が約 10 分 43 秒、396〜399 スレッドの backfill が約 12 分でした。これは限られた実測例で、次の run の所要時間を予測する目安ではありません。詳しくは [GitHub API 利用設計 — Issue #24 の観測](docs/github-api-design.md#issue-24-の観測) を参照してください。
+
+同期直後の追加取得も GitHub 側の利用枠を消費し、他の `gh` 作業に影響することがあります。次の運用にしてください。
 
 - **1 セッションにつき `sync` は 1 回**にします。過去期間の取り直し目的で `sync --since N` を重ねて実行しないでください。
-- 同期後は追加の `list` を控えてください。`list` は通知・open Issue/PR 検索のため GitHub API を呼びます。
+- 同期後は追加の `list` を控えてください。`list` は通知を取得し、`mine` では repo ごとに `gh issue list` / `gh pr list` で open 項目を列挙します（Search API ではありません）。通知スレッドや通知に含まれない watch 対象では REST metadata も取得します。同期後の一覧が必要な理由がなければ実行を省いてください。
 - 同期済みデータの確認には `daily` を使います。`daily` は LanceDB の保存済みデータだけを読み、GitHub API を呼びません。トップレベルの `--help` にある `daily` の説明から使い方を確認できます。
 - 過去期間の調査・日別件数の集計は、まず LanceDB を read-only で読みます。過去データの確認だけを理由に再同期しないでください。
 - `daily --since N` は今日を含む連続日数の表示です。複数日の全件確認が不要なら、`daily --date YYYY-MM-DD` で必要な日だけを指定してください。`--group epic` もローカル保存済みリンクから集計します。
@@ -109,7 +111,7 @@ uv run gh-work-track sync
 uv run gh-work-track daily --date 2026-09-15 --group epic > /tmp/daily-2026-09-15.md
 ```
 
-`daily` の対象日がまだ同期されていない場合、出力が空でも、その日だけを理由にバックフィルを実行せず、まず既存DBの範囲で調査してください。再取得が必要な場合は実行前に影響範囲を確認します。見積もりやクールダウンなどの追加抑制策は観測根拠が不足しているため本変更には含めず、[Issue #24](https://github.com/otolab/gh-work-track/issues/24) で利用実態と同期負荷を確認してから検討します。
+`daily` の対象日がまだ同期されていない場合、出力が空でも、その日だけを理由にバックフィルを実行せず、まず既存DBの範囲で調査してください。再取得が必要な場合は実行前に影響範囲を確認します。経路別の API 件数や rate limit の詳細、許容できる待ち時間は十分に観測できていないため、事前見積もり・追加 throttling・cooldown や固定の待ち時間は設けていません。追加の抑制策を決めるまで、上記の運用指針に従ってください。
 
 ### thread_links の Phase 1 制約
 
