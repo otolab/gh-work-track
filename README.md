@@ -90,6 +90,27 @@ GitHub 側の discovery や通知が遅れてスレッドに載る場合は、�
 
 incremental sync では、前回成功 run の取得開始時刻を global cutoff の基準にし、スレッドごとの取得開始境界として記録した `last_synced_at` と DB 内の最新イベント時刻も cutoff の下限として使います。run が overlap を超えて長時間かかっても、スレッド取得開始後から run 完了までに発生したイベントは次回の対象に残ります。timeline に cutoff 以降の activity がないスレッドでは comments の取得を省略します。GitHub の timeline API は返却順を保証していないため、新→古と確認できたページだけ early stop を行い、古→新または順序不明の場合は取りこぼし防止のため全ページを取得します。
 
+### rate limit を避ける運用
+
+`sync` は通知・検索・スレッドごとの timeline / comments など複数の GitHub API 経路を使い、対象スレッドが多いと完了まで時間がかかります。同期直後の追加取得が同じ `gh` の利用枠を消費し、他の作業にも影響することがあるため、次の運用にしてください。
+
+- **1 セッションにつき `sync` は 1 回**にします。過去期間の取り直し目的で `sync --since N` を重ねて実行しないでください。
+- 同期後は追加の `list` を控えてください。`list` は通知・open Issue/PR 検索のため GitHub API を呼びます。
+- 同期済みデータの確認には `daily` を使います。`daily` は LanceDB の保存済みデータだけを読み、GitHub API を呼びません。トップレベルの `--help` にある `daily` の説明から使い方を確認できます。
+- 過去期間の調査・日別件数の集計は、まず LanceDB を read-only で読みます。過去データの確認だけを理由に再同期しないでください。
+- `daily --since N` は今日を含む連続日数の表示です。複数日の全件確認が不要なら、`daily --date YYYY-MM-DD` で必要な日だけを指定してください。`--group epic` もローカル保存済みリンクから集計します。
+- 活動ログを `logs/gh-daily/` などに恒久保存するときは、同期後に `daily` の出力をローカル export してください。export のために追加の同期や GitHub 取得を行わないでください。
+
+```bash
+# セッション内の同期は 1 回
+uv run gh-work-track sync
+
+# 同期済みの必要日だけをローカルDBから表示
+uv run gh-work-track daily --date 2026-09-15 --group epic > /tmp/daily-2026-09-15.md
+```
+
+`daily` の対象日がまだ同期されていない場合、出力が空でも、その日だけを理由にバックフィルを実行せず、まず既存DBの範囲で調査してください。再取得が必要な場合は実行前に影響範囲を確認します。見積もりやクールダウンなどの追加抑制策は観測根拠が不足しているため本変更には含めず、[Issue #24](https://github.com/otolab/gh-work-track/issues/24) で利用実態と同期負荷を確認してから検討します。
+
 ### thread_links の Phase 1 制約
 
 `cross-referenced` の `source.issue` は `cross_ref` として保存されます。一方、GitHub

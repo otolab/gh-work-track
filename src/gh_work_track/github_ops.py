@@ -2576,7 +2576,11 @@ def format_daily_markdown(
         lines.extend(f"- {warning}" for warning in warnings)
         lines.append("")
     if not events:
-        lines.append("_該当なし（先に `sync --since N` を実行してください）_")
+        lines.append(
+            "_該当なし（対象日が未同期の可能性があります。まず既存のLanceDBにある"
+            "データを確認してください。追加取得を検討する場合は、必要性と影響範囲を"
+            "確認してから判断してください）_"
+        )
         return "\n".join(lines)
 
     if group_assignments is not None:
@@ -2899,7 +2903,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_collect)
 
-    dap = sub.add_parser("daily", help="保存済みイベントを日付ごとに一覧")
+    dap = sub.add_parser(
+        "daily",
+        help=(
+            "保存済みイベントを日付ごとに一覧（LanceDB のみ・GitHub API 不使用。"
+            "例: daily --date YYYY-MM-DD）"
+        ),
+        description=(
+            "同期済みイベントを LanceDB から表示します。GitHub API は呼び出しません。"
+            "過去期間の再調査やローカル export に使えます。"
+        ),
+        epilog=(
+            "例: gh-work-track daily --date 2026-09-15 --group epic\n"
+            "複数日の表示: gh-work-track daily --since 7"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     daily_period = dap.add_mutually_exclusive_group(required=True)
     daily_period.add_argument("--date", help="対象日 (YYYY-MM-DD)")
     daily_period.add_argument("--since", type=int, help="直近の日数（今日を含む）")

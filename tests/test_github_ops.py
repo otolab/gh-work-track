@@ -426,6 +426,16 @@ def test_metadata_parent_discovery_registers_anchor_without_parent_timeline(
     from gh_work_track import cli
 
     db_path = tmp_path / "lance"
+    fixed_now = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(cli, "datetime", FrozenDateTime)
+    monkeypatch.setattr(github_ops, "datetime", FrozenDateTime)
+
     child_a = github_ops.ThreadRef("plaidev/karte-io-systems", 169460)
     child_b = github_ops.ThreadRef("plaidev/karte-io-systems", 169462)
     parent = github_ops.ThreadRef("plaidev/karte-io-systems", 169457)

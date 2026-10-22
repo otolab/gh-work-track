@@ -90,6 +90,46 @@ def test_sync_help_explains_incremental_and_backfill_modes(capsys):
         assert "前回成功 sync 以降の incremental" in output
 
 
+def test_daily_help_points_to_saved_db_only_path(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--help"])
+
+    assert exc_info.value.code == 0
+    assert "LanceDB のみ・GitHub API 不使用" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["daily", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "GitHub API は呼び出しません" in output
+    assert "daily --date 2026-09-15 --group epic" in output
+
+
+def test_daily_empty_result_does_not_recommend_sync_or_call_github(
+    monkeypatch, tmp_path, capsys
+):
+    db_path = tmp_path / "lance"
+    WorkTrackDB(str(db_path)).init_tables()
+
+    def fail_if_github_called(*args, **kwargs):
+        pytest.fail("daily must stay on the local database path")
+
+    monkeypatch.setattr(github_ops, "gh_api", fail_if_github_called)
+    monkeypatch.setattr(github_ops, "gh_cli_json", fail_if_github_called)
+
+    assert cli.main([
+        "--db", str(db_path),
+        "daily",
+        "--date", "2026-09-15",
+    ]) == 0
+
+    output = capsys.readouterr().out
+    assert "対象日が未同期の可能性があります" in output
+    assert "既存のLanceDBにあるデータを確認してください" in output
+    assert "sync --since" not in output
+
+
 def test_sync_since_uses_backfill_without_reading_watermark(monkeypatch, tmp_path):
     db_path = tmp_path / "lance"
     collected = {}
