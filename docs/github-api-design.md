@@ -23,6 +23,8 @@ gh-work-track が GitHub API をどう使い、制限にどう対応するかを
 
 ### Issue #24 の観測
 
+元調査コメントにある `list` 経路の記述は[訂正コメント](https://github.com/otolab/gh-work-track/issues/24#issuecomment-6336389097)を参照してください。
+
 2026-10-22 時点で手元に保存された `sync_runs` 14 件（成功12、失敗2）のうち、成功した incremental 9 件は21〜643秒、対象11〜349スレッドでした。2026-10-21 の run は349スレッド・2,437イベントで約10分43秒です。成功した backfill 3 件は114〜726秒、76〜399スレッドで、396〜399スレッドを扱った2件は約12分でした。これは一利用者の保存履歴にある実測例で、次回の所要時間や安全な対象数を保証する見積もりではありません。
 
 query ごとの warning が残る run では、Search の論理 `gh search` 呼び出しは各28回（global 7、repo 21）でした。これは gh コマンド数であり、gh 内部のページングを含む HTTP リクエスト総数ではありません。経路別の API ページ数は `sync_runs` に記録されていません。成功 run の warnings に retry 記録はありませんでしたが、失敗 run は開始時の空 warnings が失敗記録にも残るため、warnings が空であることは retry 不在の根拠になりません。失敗原因を Search / Core、429 / secondary rate limit、Retry-After 別に照合できる構造化記録もありません。
